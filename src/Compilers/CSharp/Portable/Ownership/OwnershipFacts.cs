@@ -474,6 +474,16 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             bool returnsBorrow = m.RefKind != RefKind.None || (!m.ReturnsVoid && (IsBorrowHolder(m.ReturnType) || MayCarry(m, m.ReturnType))) || genericFromRefStruct;
             if (!returnsBorrow) return sig;
 
+            // Delegates: a caller of Invoke cannot see where a lambda's result comes from, so it binds the
+            // result to every input, the delegate included (for a [Mut] one, its exclusive borrow). A lambda's
+            // body may then return a borrow of any of them: its captures, or the data behind an argument,
+            // as in `OrderBy(s => s)` on Ref<string> items. Both sides agree, as Rust's closure signatures do.
+            if (IsClosureBody(m) || m.MethodKind == MethodKind.DelegateInvoke)
+            {
+                sig.OutputFromAll = true;
+                return sig;
+            }
+
             // A value taken out of a container (Pop, Remove, Clone) carries its content, not a borrow of it.
             if (container && m.RefKind == RefKind.None && !IsBorrowHolder(m.ReturnType) && MayCarry(m, m.ReturnType))
             {
