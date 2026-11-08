@@ -226,7 +226,14 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// delegate behaves like Rust's <c>Box&lt;dyn Fn() + 'a&gt;</c>: its lifetime is that of what it captures.
         /// </summary>
         public static bool IsBorrowHolder(TypeSymbol t) => t.IsRefLikeOrAllowsRefLikeType() || t.IsDelegateType() || IsCoroutineType(t)
-            || IsReference(t) || CarriesBorrows(t);
+            || IsReference(t) || CarriesBorrows(t) || HasLifetimeParameters(t);
+
+        /// <summary>
+        /// A class or struct that declares lifetimes, like Rust's <c>struct Index&lt;'a&gt;</c>: it may hold borrows in
+        /// the fields that name them. A class is Rust's <c>Box&lt;Index&lt;'a&gt;&gt;</c>, its one owner keeps them alive.
+        /// </summary>
+        public static bool HasLifetimeParameters(TypeSymbol t)
+            => t.TypeKind is TypeKind.Class or TypeKind.Struct && !Lifetimes.Declared(t).IsEmpty;
 
         /// <summary>Ref&lt;T&gt; and RefMut&lt;T&gt;: Rust's &amp;T and &amp;mut T as values, usable as type arguments.</summary>
         public static bool IsReference(TypeSymbol t) => t is NamedTypeSymbol && HasAttribute(t, "ReferenceAttribute");
@@ -303,7 +310,13 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         {
             if (t.IsDelegateType() || t is ArrayTypeSymbol || IsCoroutineType(t)) return false;
             if (t.TypeKind == TypeKind.TypeParameter) return ((TypeParameterSymbol)t).AllowsRefLikeType;
-            if (!t.IsRefLikeType) return false;
+            // Rust's drop check: a value that holds borrows and has a destructor uses them when it is
+            // dropped, so they must still be alive then. That is a ref struct, or a class or struct that
+            // declares lifetimes.
+            // Ref and RefMut are references: dropping one observes nothing (RefMut's empty destructor only
+            // makes it move-only), as Rust's &T and &mut T have no Drop.
+            if (IsReference(t)) return false;
+            if (!t.IsRefLikeType && !HasLifetimeParameters(t)) return false;
             if (FindDestructor(t) is not null) return true;
             return t is NamedTypeSymbol n && InstanceFields(n).Any(f => f.RefKind == RefKind.None && !Equals(f.Type, t) && DropUsesBorrows(f.Type));
         }

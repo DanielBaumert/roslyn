@@ -647,17 +647,20 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         {
             if (p is null || p.Static is not null || _localSlots[p.Local] is not { } slots) return null;
             if (p.Projs.IsEmpty) return slots;
-            return p.Projs.Length == 1 && p.Projs[0] is DerefProj && _b.Locals[p.Local].Type.IsRef ? slots : null;
+            return p.Projs.Length == 1 && p.Projs[0] is DerefProj && IsIndirect(p.Local) ? slots : null;
         }
 
         private int[] SlotsOf(Operand op) => SlotsOf(op is CopyOp c ? c.Place : op is MoveOp m ? m.Place : null);
+
+        /// <summary>Whether a local reaches its value through a dereference: a reference, or a class's handle.</summary>
+        private bool IsIndirect(int local) => _b.Locals[local].Type.IsRef || _b.Locals[local].Type.Type.TypeKind == TypeKind.Class;
 
         /// <summary>The field of a lifetime-parameterized value that a place goes through, with its slot; -1 if none.</summary>
         private int SlotField(Place p, out FieldSymbol field)
         {
             field = null;
             if (p.Static is not null || _localSlots[p.Local] is null) return -1;
-            int i = _b.Locals[p.Local].Type.IsRef ? 1 : 0;
+            int i = IsIndirect(p.Local) ? 1 : 0;
             if (i == 1 && (p.Projs.Length == 0 || p.Projs[0] is not DerefProj)) return -1;
             if (i >= p.Projs.Length || p.Projs[i] is not FieldProj f) return -1;
             field = f.Field;
@@ -698,7 +701,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         {
             if (p.Static is not null) return -1;
 
-            // Nothing in a heap object can hold a borrow: its fields live as long as the program may.
+            // A field that names a lifetime parameter, `ref readonly 'a int X` or `Ref<'a, int> R`, borrows for
+            // that slot only, also in a heap object that declares the lifetime.
+            int slot = SlotField(p, out _);
+            if (slot >= 0) return _localSlots[p.Local][slot];
+
+            // Nothing else in a heap object can hold a borrow: its fields live as long as the program may.
             // Tasks are the exception, because a task is a borrow holder itself.
             var t = BaseType(p);
             foreach (var proj in p.Projs)
@@ -706,10 +714,6 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 if (t.Contents && !OwnershipFacts.IsCoroutineType(t.Type)) return -1;
                 t = MirBody.Project(t, proj);
             }
-
-            // A field that names a lifetime parameter, `ref readonly 'a int X`, borrows for that slot only.
-            int slot = SlotField(p, out _);
-            if (slot >= 0) return _localSlots[p.Local][slot];
 
             if (_localInner[p.Local] >= 0 && p.Projs.Length > 0 && p.Projs[0] is DerefProj) return _localInner[p.Local];
             return _localRegion[p.Local];
@@ -742,6 +746,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 if (p.Projs[i] is FieldProj { Field.RefKind: not RefKind.None } && p.Projs[i + 1] is DerefProj) return true;
             return false;
         }
+
+        /// <summary>Whether a place ends at a field, or at the object a class-typed field points to.</summary>
+        private static bool EndsAtField(Place p)
+            => p.Projs[^1] is FieldProj || (p.Projs.Length >= 2 && p.Projs[^1] is DerefProj && p.Projs[^2] is FieldProj { Field.Type.TypeKind: TypeKind.Class });
 
         private bool ThroughSharedSlotField(Place p)
             => SlotField(p, out var field) >= 0 && field.RefKind == RefKind.RefReadOnly;
@@ -787,14 +795,16 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             for (int i = 0; i < _localSlots.Length; i++)
             {
                 var type = _b.Locals[i].Type;
-                int n = type.Contents ? 0 : Lifetimes.Declared(type.Type).Length;
-                int whole = type.IsRef ? _localInner[i] : _localRegion[i];
-                if (n == 0 || whole < 0) continue;
+                int n = Lifetimes.Declared(type.Type).Length;
+                int whole = type.Contents ? -1 : type.IsRef ? _localInner[i] : _localRegion[i];
+                // A reference into a heap object (`&contents Index`) has no region for the object as a whole,
+                // only its slots; the object's owner keeps them alive.
+                if (n == 0 || (whole < 0 && !type.Contents)) continue;
                 _localSlots[i] = new int[n];
                 for (int k = 0; k < n; k++)
                 {
                     _localSlots[i][k] = NewRegion();
-                    Outlives(_localSlots[i][k], whole, _b.Syntax);
+                    if (whole >= 0) Outlives(_localSlots[i][k], whole, _b.Syntax);
                 }
             }
 
@@ -933,8 +943,17 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                                     Outlives(from[k], to[k], a.Syntax);
                                     if (r.Mode == RefMode.Mut) Outlives(to[k], from[k], a.Syntax);
                                 }
+                            // A value kept where no region tracks it (a captured variable in a closure's
+                            // environment, a field of an object without lifetimes) had to be 'static to get
+                            // there; through `&mut`, only 'static borrows may be stored into it.
+                            else if (r.Mode == RefMode.Mut && SlotsOf(r.Place) is null && SlotsOf(a.Dest) is { } into)
+                                foreach (var k in into) Outlives(k, Universal("'static"), a.Syntax);
                             // Remember what a receiver borrows, for the content lifetime of containers.
                             if (a.Dest.IsLocal && r.Place.Static is null && r.Place.Projs.All(x => x is DerefProj)) _refSource[a.Dest.Local] = r.Place.Local;
+                            // A container in a field that names a lifetime (`List<Ref<'a, int>> Items`): its content
+                            // lives for that slot.
+                            if (a.Dest.IsLocal && r.Place.Static is null && SlotField(r.Place, out _) is int contentSlot and >= 0 && EndsAtField(r.Place))
+                                _refSlot[a.Dest.Local] = _localSlots[r.Place.Local][contentSlot];
                             if (NeedsLoan(r.Place))
                             {
                                 var loan = new Loan { Index = _loans.Count, Point = point, Region = NewRegion(), Place = r.Place, Mode = r.Mode, Syntax = a.Syntax };
@@ -972,12 +991,15 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         }
 
         private readonly Dictionary<int, int> _refSource = new Dictionary<int, int>();
+        /// <summary>Receivers borrowed from a container field with a lifetime parameter: the slot its content lives for.</summary>
+        private readonly Dictionary<int, int> _refSlot = new Dictionary<int, int>();
 
         /// <summary>The region of the container a receiver borrows, or -1.</summary>
         private int ContentRegion(Operand receiver)
         {
             Place p = receiver is CopyOp c ? c.Place : receiver is MoveOp mo ? mo.Place : null;
             if (p is null || !p.IsLocal) return -1;
+            if (_refSlot.TryGetValue(p.Local, out int slotContent)) return slotContent;
             int local = _refSource.TryGetValue(p.Local, out int source) ? source : p.Local;
             var t = _b.Locals[local].Type;
             return t.IsRef || !OwnershipFacts.CarriesBorrows(t.Type) ? -1 : _localRegion[local];

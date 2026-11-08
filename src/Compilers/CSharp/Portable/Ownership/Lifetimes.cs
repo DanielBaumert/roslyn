@@ -92,11 +92,23 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             {
                 if (r.GetSyntax() is not VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax decl }) continue;
                 string name = decl.Type is RefTypeSyntax refType && refType.LifetimeToken.ValueText is { Length: > 0 } own ? own : null;
-                var args = Arguments(decl.Type);
+                var args = Nested(decl.Type);
                 if (name is null && args.Count > 0 && args.All(a => a == args[0])) name = args[0];
                 if (name is not null) return declared.IndexOf(name);
             }
             return -1;
+        }
+
+        /// <summary>Every lifetime written anywhere in a type: <c>['a]</c> for <c>List&lt;Ref&lt;'a, int&gt;&gt;</c>.</summary>
+        private static List<string> Nested(TypeSyntax syntax)
+        {
+            var names = new List<string>();
+            foreach (var node in syntax.DescendantNodesAndSelf())
+            {
+                if (node is GenericNameSyntax g) names.AddRange(InTrivia(g.TypeArgumentList.LessThanToken.TrailingTrivia));
+                else if (node is IdentifierNameSyntax i) names.AddRange(InTrivia(i.Identifier.TrailingTrivia));
+            }
+            return names;
         }
 
         private static List<string> InTrivia(SyntaxTriviaList trivia)
