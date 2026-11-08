@@ -28,6 +28,9 @@ namespace Microsoft.CodeAnalysis.CSharp
             BoundExpression left = BindValue(node.Left, diagnostics, GetBinaryAssignmentKind(node.Kind()));
             ReportSuppressionIfNeeded(left, diagnostics);
             BoundExpression right = BindValue(node.Right, diagnostics, BindValueKind.RValue);
+            // RustSharp: `sum += x` with `x: Ref<int>` like Rust's `impl AddAssign<&i32> for i32`. The target
+            // is never dereferenced: writing through a RefMut stays `r.Value += 1`, Rust's `*r += 1`.
+            right = AutoDeref(node, right, member: null, diagnostics);
             BinaryOperatorKind kind = SyntaxKindToBinaryOperatorKind(node.Kind());
 
             // If either operand is bad, don't try to do binary operator overload resolution; that will just
@@ -917,6 +920,8 @@ namespace Microsoft.CodeAnalysis.CSharp
                 return new BoundBinaryOperator(node, kind, ConstantValue.NotAvailable, methodOpt: null, constrainedToTypeOpt: null, LookupResultKind.Empty, left, right, GetBinaryOperatorErrorType(kind, diagnostics, node), true);
             }
 
+            left = AutoDeref(node, left, member: null, diagnostics);
+            right = AutoDeref(node, right, member: null, diagnostics);
             TypeSymbol leftType = left.Type;
             TypeSymbol rightType = right.Type;
 
@@ -4172,6 +4177,7 @@ namespace Microsoft.CodeAnalysis.CSharp
         private BoundExpression BindUnaryOperator(PrefixUnaryExpressionSyntax node, BindingDiagnosticBag diagnostics)
         {
             BoundExpression operand = BindToNaturalType(BindValue(node.Operand, diagnostics, GetUnaryAssignmentKind(node.Kind())), diagnostics);
+            if (GetUnaryAssignmentKind(node.Kind()) == BindValueKind.RValue) operand = AutoDeref(node, operand, member: null, diagnostics);
             BoundLiteral constant = BindIntegralMinValConstants(node, operand, diagnostics);
             return constant ?? BindUnaryOperatorCore(node, node.OperatorToken.Text, operand, diagnostics);
         }

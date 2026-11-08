@@ -7727,6 +7727,7 @@ namespace Microsoft.CodeAnalysis.CSharp
             }
 
             boundLeft = BindToNaturalType(boundLeft, diagnostics);
+            boundLeft = AutoDeref(node, boundLeft, right.Identifier.ValueText, diagnostics);
             leftType = boundLeft.Type;
             var lookupResult = LookupResult.GetInstance();
             try
@@ -11340,12 +11341,35 @@ namespace Microsoft.CodeAnalysis.CSharp
                 => location ?? GetAnonymousFunctionLocation(node);
         }
 
+        /// <summary>RustSharp: there is no null, in the program and in the core library alike. Only unsafe code keeps null pointers.</summary>
+        internal static bool IsNullFree(SyntaxNode node) => node.SyntaxTree?.Options is CSharpParseOptions { IsOwnershipEnabled: true };
+
+        /// <summary>
+        /// RustSharp: Rust's auto-deref. On a <c>Ref&lt;T&gt;</c> or <c>RefMut&lt;T&gt;</c> value, a member that the
+        /// reference type does not declare itself (<paramref name="member"/>) is looked up on the value behind
+        /// it, as if <c>.Value</c> had been written, through any number of references. With a null
+        /// <paramref name="member"/> (an operator operand) the reference is always dereferenced: Rust compares
+        /// and computes with <c>&amp;T</c> through <c>impl PartialOrd for &amp;T</c> and the like.
+        /// </summary>
+        internal BoundExpression AutoDeref(SyntaxNode node, BoundExpression receiver, string? member, BindingDiagnosticBag diagnostics)
+        {
+            if (!IsNullFree(node) || receiver.Kind is BoundKind.TypeExpression or BoundKind.NamespaceExpression or BoundKind.TypeOrValueExpression)
+                return receiver;
+            while (receiver.Type is NamedTypeSymbol t && !receiver.HasAnyErrors && Ownership.OwnershipFacts.IsReference(t)
+                && (member is null || t.GetMembers(member).IsEmpty)
+                && t.GetMembers("Value").OfType<PropertySymbol>().FirstOrDefault() is { } value)
+            {
+                // The reference itself is only read: this also settles an indexer's accessor (`list[0].Name`).
+                receiver = CheckValue(receiver, BindValueKind.RValue, diagnostics);
+                receiver = BindPropertyAccess(node, receiver, value, diagnostics, LookupResultKind.Viable, hasErrors: false);
+            }
+            return receiver;
+        }
+
         /// <summary>
         /// RustSharp: on a Result or an Option, `x?.M()` is Rust's `x?.m()`: propagate, then access the value.
         /// It binds as <c>{ var t = x?; t.M() }</c>.
         /// </summary>
-        /// <summary>RustSharp: there is no null, in the program and in the core library alike. Only unsafe code keeps null pointers.</summary>
-        internal static bool IsNullFree(SyntaxNode node) => node.SyntaxTree?.Options is CSharpParseOptions { IsOwnershipEnabled: true };
 
         private BoundExpression? TryBindPropagatingAccess(ConditionalAccessExpressionSyntax node, BindingDiagnosticBag diagnostics)
         {

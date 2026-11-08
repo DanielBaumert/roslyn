@@ -31,6 +31,19 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         private static bool HasStructuralEquality(TypeSymbol t)
             => t.IsAnonymousType || t.IsRecord || t.IsRecordStruct || OwnershipFacts.HasAttribute(t, "EqAttribute");
 
+        /// <summary>
+        /// Ref&lt;T&gt; and RefMut&lt;T&gt; compare, test and hash what they point at, like Rust's impls for &amp;T.
+        /// Emits a load of the pointer in <paramref name="slot"/> into <c>%{name}</c> and returns T.
+        /// </summary>
+        private TypeSymbol DerefReference(StringBuilder sb, TypeSymbol t, string slot, string name)
+        {
+            if (!OwnershipFacts.IsReference(t)) return null;
+            var layout = LayoutOf(t);
+            var field = layout.Fields.First(f => f.Type is PointerTypeSymbol);
+            sb.Append($"  %{name}.f = getelementptr {layout.LlvmType}, ptr {slot}, i32 0, i32 {layout.Index[field.OriginalDefinition]}\n  %{name} = load ptr, ptr %{name}.f\n");
+            return ((PointerTypeSymbol)field.Type).PointedAtType;
+        }
+
         private readonly Dictionary<TypeSymbol, string> _compares = new Dictionary<TypeSymbol, string>(s_cmp);
 
         /// <summary><c>i32 compare(ptr a, ptr b)</c>: negative, zero or positive, like Rust's Ord.</summary>
@@ -44,7 +57,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             var u = Unenum(t);
             bool handle = IsHandle(t);
 
-            if (OwnershipFacts.UserTrait(t, "IOrd", "Compare", generic: true) is { } user)
+            if (DerefReference(sb, t, "%a", "ra") is { } ordTarget)
+            {
+                DerefReference(sb, t, "%b", "rb");
+                sb.Append($"  %r = call i32 {CompareFn(ordTarget)}(ptr %ra, ptr %rb)\n  ret i32 %r\n");
+            }
+            else if (OwnershipFacts.UserTrait(t, "IOrd", "Compare", generic: true) is { } user)
             {
                 string self = "%a";
                 if (handle) { sb.Append("  %self = load ptr, ptr %a\n"); self = "%self"; }
@@ -229,7 +247,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             string ty = Ty(t);
             var u = Unenum(t);
 
-            if (OwnershipFacts.UserTrait(t, "IEq", "Eq", generic: true) is { } user)
+            if (DerefReference(sb, t, "%a", "ra") is { } eqTarget)
+            {
+                DerefReference(sb, t, "%b", "rb");
+                sb.Append($"  %r = call i8 {EqFn(eqTarget)}(ptr %ra, ptr %rb)\n  ret i8 %r\n");
+            }
+            else if (OwnershipFacts.UserTrait(t, "IEq", "Eq", generic: true) is { } user)
             {
                 string self = "%a";
                 if (IsHandle(t)) { sb.Append("  %self = load ptr, ptr %a\n"); self = "%self"; }
@@ -310,7 +333,11 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             var sb = new StringBuilder($"define internal i32 {name}(ptr %s) {{\n");
             string ty = Ty(t);
 
-            if (OwnershipFacts.UserTrait(t, "IHash", "Hash", generic: false) is { } user)
+            if (DerefReference(sb, t, "%s", "rs") is { } hashTarget)
+            {
+                sb.Append($"  %r = call i32 {HashFn(hashTarget)}(ptr %rs)\n  ret i32 %r\n");
+            }
+            else if (OwnershipFacts.UserTrait(t, "IHash", "Hash", generic: false) is { } user)
             {
                 string self = "%s";
                 if (IsHandle(t)) { sb.Append("  %self = load ptr, ptr %s\n"); self = "%self"; }
