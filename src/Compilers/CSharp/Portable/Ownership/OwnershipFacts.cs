@@ -222,6 +222,15 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// <summary>Ref&lt;T&gt; and RefMut&lt;T&gt;: Rust's &amp;T and &amp;mut T as values, usable as type arguments.</summary>
         public static bool IsReference(TypeSymbol t) => t is NamedTypeSymbol && HasAttribute(t, "ReferenceAttribute");
 
+        /// <summary>Whether a type is or contains a type parameter, which might stand for a reference.</summary>
+        private static bool MentionsTypeParameter(TypeSymbol t) => t switch
+        {
+            TypeParameterSymbol => true,
+            ArrayTypeSymbol a => MentionsTypeParameter(a.ElementType),
+            NamedTypeSymbol n => n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics.Any(a => MentionsTypeParameter(a.Type)),
+            _ => false,
+        };
+
         /// <summary>
         /// Result and Option may contain borrows, like Rust's Result&lt;&amp;T, &amp;E&gt;. Such a value has one lifetime,
         /// the one of what it borrows. Only an actual reference among the type arguments makes it one.
@@ -414,7 +423,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 return sig;
             }
 
-            bool returnsBorrow = m.RefKind != RefKind.None || (!m.ReturnsVoid && (IsBorrowHolder(m.ReturnType) || MayCarry(m, m.ReturnType)));
+            // A ref struct's own generic result (an iterator's `Option<T> Next()`, an enumerator's `T Current`)
+            // may be a reference for some T, and then it points at what the ref struct borrows.
+            bool genericFromRefStruct = !m.ReturnsVoid && m.ContainingType.IsRefLikeType && MentionsTypeParameter(m.ReturnType);
+            bool returnsBorrow = m.RefKind != RefKind.None || (!m.ReturnsVoid && (IsBorrowHolder(m.ReturnType) || MayCarry(m, m.ReturnType))) || genericFromRefStruct;
             if (!returnsBorrow) return sig;
 
             // A value taken out of a container (Pop, Remove, Clone) carries its content, not a borrow of it.
@@ -453,7 +465,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             // A ref struct or Ref cannot return a reference to its own fields (C# forbids it), so a
             // reference it returns points at what it borrows: Rust's `fn next(&mut self) -> &'a T`.
             // Not with a destructor: a guard releases what it guards, so its references end with it.
-            if (!m.IsStatic && thisBorrows && (m.RefKind != RefKind.None || IsBorrowHolder(m.ReturnType))
+            if (!m.IsStatic && thisBorrows && (m.RefKind != RefKind.None || IsBorrowHolder(m.ReturnType) || genericFromRefStruct)
                 && (m.ContainingType.IsRefLikeType || IsReference(m.ContainingType)) && FindDestructor(m.ContainingType) is null)
             {
                 // With further borrowed inputs (`text.Split(separator)`) the result borrows those too.
