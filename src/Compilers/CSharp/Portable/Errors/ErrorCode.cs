@@ -2468,6 +2468,7 @@ namespace Microsoft.CodeAnalysis.CSharp
         ERR_OwnNoNullableContext = 9936,
         ERR_OwnNoNullOperator = 9937,
         ERR_OwnNullDefault = 9938,
+        ERR_OwnLifetimeArity = 9939,
 
         // Note: you will need to do the following after adding errors:
         //  1) Update ErrorFacts.IsBuildOnlyDiagnostic (src/Compilers/CSharp/Portable/Errors/ErrorFacts.cs)

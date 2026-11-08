@@ -1785,7 +1785,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
                 name = this.ParseIdentifierToken();
             }
 
-            var typeParameters = this.ParseTypeParameterList();
+            var typeParameters = this.ParseTypeParameterList(ref name);
 
             // For extension declarations, there must be a parameter list
             var paramList = CurrentToken.Kind == SyntaxKind.OpenParenToken || isExtension
@@ -5649,7 +5649,7 @@ parse_member_name:;
             var saveTerm = _termState;
             _termState |= TerminatorState.IsEndOfMethodSignature;
             var name = this.ParseIdentifierToken();
-            var typeParameters = this.ParseTypeParameterList();
+            var typeParameters = this.ParseTypeParameterList(ref name);
             var parameterList = this.ParseParenthesizedParameterList(forExtension: false);
             var constraints = default(SyntaxListBuilder<TypeParameterConstraintClauseSyntax>);
 
@@ -5716,7 +5716,7 @@ parse_member_name:;
             var keyword = AddLeadingSkippedSyntax(SyntaxFactory.MissingToken(SyntaxKind.RecordKeyword), enumToken);
             modifiers.Add(SyntaxFactory.MissingToken(SyntaxKind.AbstractKeyword));
             var name = this.ParseIdentifierToken();
-            var typeParameters = this.ParseTypeParameterList();
+            var typeParameters = this.ParseTypeParameterList(ref name);
             var baseList = this.ParseBaseList();
 
             var constraints = _pool.Allocate<TypeParameterConstraintClauseSyntax>();
@@ -6015,6 +6015,57 @@ parse_member_name:;
                 IsFeatureEnabled(MessageID.IDS_FeatureFieldKeyword);
         }
 
+        /// <summary>
+        /// RustSharp: lifetime parameters, `Pair<'a, 'b>` or `Entry<'a, T>`. They come first, as in Rust, and
+        /// stay out of the tree proper so that Roslyn binds the type parameters alone. A list of lifetimes
+        /// only becomes skipped tokens behind <paramref name="name"/>; in a mixed list they follow the `<`.
+        /// The ownership analysis (Ownership/Lifetimes.cs) reads them back.
+        /// </summary>
+        private TypeParameterListSyntax ParseTypeParameterList(ref SyntaxToken name)
+        {
+            if (IsLifetimeOnlyList())
+            {
+                name = EatLifetimeOnlyList(name);
+                return null;
+            }
+            return ParseTypeParameterList();
+        }
+
+        /// <summary>RustSharp: whether `&lt;` starts a list of lifetimes only, such as `&lt;'a, '_&gt;`.</summary>
+        private bool IsLifetimeOnlyList()
+        {
+            if (!this.Options.IsOwnershipEnabled || this.CurrentToken.Kind != SyntaxKind.LessThanToken) return false;
+            for (int i = 1; ; i += 2)
+            {
+                if (this.PeekToken(i).Kind != SyntaxKind.LifetimeToken) return false;
+                if (this.PeekToken(i + 1).Kind == SyntaxKind.GreaterThanToken) return true;
+                if (this.PeekToken(i + 1).Kind != SyntaxKind.CommaToken) return false;
+            }
+        }
+
+        private TNode EatLifetimeOnlyList<TNode>(TNode node) where TNode : CSharpSyntaxNode
+        {
+            node = AddTrailingSkippedSyntax(node, this.EatToken(SyntaxKind.LessThanToken));
+            while (true)
+            {
+                node = AddTrailingSkippedSyntax(node, this.EatToken(SyntaxKind.LifetimeToken));
+                if (this.CurrentToken.Kind != SyntaxKind.CommaToken) break;
+                node = AddTrailingSkippedSyntax(node, this.EatToken());
+            }
+            return AddTrailingSkippedSyntax(node, this.EatToken(SyntaxKind.GreaterThanToken));
+        }
+
+        /// <summary>RustSharp: the leading lifetimes of a mixed list, `'a, ` in `&lt;'a, T&gt;`, as skipped tokens behind the `&lt;`.</summary>
+        private SyntaxToken EatLeadingLifetimes(SyntaxToken open)
+        {
+            while (this.Options.IsOwnershipEnabled && this.CurrentToken.Kind == SyntaxKind.LifetimeToken && this.PeekToken(1).Kind == SyntaxKind.CommaToken)
+            {
+                open = AddTrailingSkippedSyntax(open, this.EatToken());
+                open = AddTrailingSkippedSyntax(open, this.EatToken());
+            }
+            return open;
+        }
+
         private TypeParameterListSyntax ParseTypeParameterList()
         {
             if (this.CurrentToken.Kind != SyntaxKind.LessThanToken)
@@ -6025,7 +6076,7 @@ parse_member_name:;
             var saveTerm = _termState;
             _termState |= TerminatorState.IsEndOfTypeParameterList;
 
-            var open = this.EatToken(SyntaxKind.LessThanToken);
+            var open = EatLeadingLifetimes(this.EatToken(SyntaxKind.LessThanToken));
             var parameters = this.ParseCommaSeparatedSyntaxList(
                 ref open,
                 SyntaxKind.GreaterThanToken,
@@ -6107,6 +6158,12 @@ parse_member_name:;
             // The name parsing will then stop at the first "<". It doesn't make sense to pass both Generic and IgnoreGeneric.
 
             SimpleNameSyntax name = id;
+            // RustSharp: `Pair<'a, 'b>` names lifetimes only; for Roslyn it stays the plain name `Pair`.
+            if (IsLifetimeOnlyList())
+            {
+                return EatLifetimeOnlyList(id);
+            }
+
             if (this.CurrentToken.Kind == SyntaxKind.LessThanToken)
             {
                 ScanTypeArgumentListKind kind;
@@ -6313,6 +6370,18 @@ parse_member_name:;
                     return result;
                 }
 
+                // RustSharp: `Ref<'a, T>`. A lifetime is never an expression, so this is a type argument list.
+                if (this.Options.IsOwnershipEnabled && this.CurrentToken.Kind == SyntaxKind.LifetimeToken)
+                {
+                    this.EatToken();
+                    isDefinitelyTypeArgumentList = true;
+                    lastScannedType = ScanTypeFlags.GenericTypeOrMethod;
+                    if (this.CurrentToken.Kind == SyntaxKind.CommaToken) continue;
+                    if (this.CurrentToken.Kind != SyntaxKind.GreaterThanToken) { greaterThanToken = null; return ScanTypeFlags.NotType; }
+                    greaterThanToken = this.EatToken();
+                    return ScanTypeFlags.GenericTypeOrMethod;
+                }
+
                 // Allow for any chain of errant commas in the generic name.  like `Dictionary<,int>` or
                 // `Dictionary<int,,>` We still want to think of these as generics, just with missing type-arguments, vs
                 // some invalid tree-expression that we would otherwise form.
@@ -6464,6 +6533,7 @@ parse_member_name:;
             var isOpenName = this.IsOpenName();
             open = this.EatToken(SyntaxKind.LessThanToken);
             open = CheckFeatureAvailability(open, MessageID.IDS_FeatureGenerics);
+            open = EatLeadingLifetimes(open);
 
             if (isOpenName)
             {
@@ -6709,7 +6779,7 @@ parse_member_name:;
                         beforeIdentifierPoint = GetResetPoint();
                         beforeIdentifierPointSet = true;
                         identifierOrThisOpt = this.EatToken();
-                        typeParameterListOpt = this.ParseTypeParameterList();
+                        typeParameterListOpt = this.ParseTypeParameterList(ref identifierOrThisOpt);
                         break;
                     }
 
@@ -6737,7 +6807,7 @@ parse_member_name:;
                         }
 
                         identifierOrThisOpt = this.ParseIdentifierToken();
-                        typeParameterListOpt = this.ParseTypeParameterList();
+                        typeParameterListOpt = this.ParseTypeParameterList(ref identifierOrThisOpt);
                         break;
                     }
                     else

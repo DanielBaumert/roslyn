@@ -634,6 +634,35 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         private readonly HashSet<(int Sup, int Sub)> _implied = new HashSet<(int, int)>();
         private int[] _localRegion;
         private int[] _localInner;
+        /// <summary>
+        /// Lifetime parameters: for a local whose type (or, for a reference, whose referent) declares
+        /// lifetimes, one region per slot, such as 'a and 'b of Pair&lt;'a, 'b&gt;; null for any other local.
+        /// The local's own region (or inner region) stays the whole value: every slot outlives it, so a
+        /// live value keeps all its lifetimes alive, as in Rust. Only a field access picks a single slot.
+        /// </summary>
+        private int[][] _localSlots;
+
+        /// <summary>The slots of the value at a whole local, or behind a reference local; null otherwise.</summary>
+        private int[] SlotsOf(Place p)
+        {
+            if (p is null || p.Static is not null || _localSlots[p.Local] is not { } slots) return null;
+            if (p.Projs.IsEmpty) return slots;
+            return p.Projs.Length == 1 && p.Projs[0] is DerefProj && _b.Locals[p.Local].Type.IsRef ? slots : null;
+        }
+
+        private int[] SlotsOf(Operand op) => SlotsOf(op is CopyOp c ? c.Place : op is MoveOp m ? m.Place : null);
+
+        /// <summary>The field of a lifetime-parameterized value that a place goes through, with its slot; -1 if none.</summary>
+        private int SlotField(Place p, out FieldSymbol field)
+        {
+            field = null;
+            if (p.Static is not null || _localSlots[p.Local] is null) return -1;
+            int i = _b.Locals[p.Local].Type.IsRef ? 1 : 0;
+            if (i == 1 && (p.Projs.Length == 0 || p.Projs[0] is not DerefProj)) return -1;
+            if (i >= p.Projs.Length || p.Projs[i] is not FieldProj f) return -1;
+            field = f.Field;
+            return Lifetimes.FieldSlot(f.Field);
+        }
 
         private int NewRegion()
         {
@@ -678,6 +707,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 t = MirBody.Project(t, proj);
             }
 
+            // A field that names a lifetime parameter, `ref readonly 'a int X`, borrows for that slot only.
+            int slot = SlotField(p, out _);
+            if (slot >= 0) return _localSlots[p.Local][slot];
+
             if (_localInner[p.Local] >= 0 && p.Projs.Length > 0 && p.Projs[0] is DerefProj) return _localInner[p.Local];
             return _localRegion[p.Local];
         }
@@ -688,8 +721,16 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (src is null) return;
             Outlives(RegionOf(src), RegionOf(dest), syntax);
             if (src.IsLocal && dest.IsLocal) Outlives(_localInner[src.Local], _localInner[dest.Local], syntax);
+            // Slot by slot: a value may move to where its lifetimes are shorter (covariance).
+            if (SlotsOf(src) is { } from && SlotsOf(dest) is { } to && from.Length == to.Length)
+                for (int k = 0; k < from.Length; k++) Outlives(from[k], to[k], syntax);
         }
 
+        /// <summary>
+        /// Whether a reborrow reaches its data through a shared reference field with a lifetime parameter.
+        /// Like Rust's supporting prefixes, the borrow then depends on that field's lifetime alone, not on
+        /// the reference that led to the value: <c>ref pair.X</c> through <c>in Pair&lt;'a, 'b&gt; pair</c> lives for 'a.
+        /// </summary>
         /// <summary>
         /// Whether a place, rooted at a reference to a borrow holder, dereferences a reference stored in one of
         /// its fields: <c>*((*t).P)</c> for <c>ref View t</c>. What that reaches lives for the holder's data.
@@ -701,6 +742,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 if (p.Projs[i] is FieldProj { Field.RefKind: not RefKind.None } && p.Projs[i + 1] is DerefProj) return true;
             return false;
         }
+
+        private bool ThroughSharedSlotField(Place p)
+            => SlotField(p, out var field) >= 0 && field.RefKind == RefKind.RefReadOnly;
 
         /// <summary>A loan is pointless behind a shared reference or a raw pointer.</summary>
         private bool NeedsLoan(Place p)
@@ -739,6 +783,21 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 _localInner[i] = type.IsRef && !type.Contents && OwnershipFacts.IsBorrowHolder(type.Type) ? NewRegion() : -1;
             }
 
+            _localSlots = new int[_b.Locals.Count][];
+            for (int i = 0; i < _localSlots.Length; i++)
+            {
+                var type = _b.Locals[i].Type;
+                int n = type.Contents ? 0 : Lifetimes.Declared(type.Type).Length;
+                int whole = type.IsRef ? _localInner[i] : _localRegion[i];
+                if (n == 0 || whole < 0) continue;
+                _localSlots[i] = new int[n];
+                for (int k = 0; k < n; k++)
+                {
+                    _localSlots[i][k] = NewRegion();
+                    Outlives(_localSlots[i][k], whole, _b.Syntax);
+                }
+            }
+
             int returnRegion = -1;
             for (int i = 0; i < sig.Inputs.Length && i < _b.ArgCount; i++)
             {
@@ -765,6 +824,22 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             for (int local = 1; local <= _b.ArgCount; local++)
                 if (_localRegion[local] >= 0 && !_universalRegions.Contains(_localRegion[local]))
                     _localRegion[local] = Universal("'#anon" + local);
+
+            // Lifetime parameters of the inputs: each slot is the universal region its name stands for, and
+            // outlives the value as a whole (a Pair<'a, 'b> is valid only while 'a and 'b are).
+            for (int i = 0; i < sig.Inputs.Length && i < _b.ArgCount; i++)
+            {
+                int local = i + 1;
+                if (sig.InputSlots?[i] is not { } names || _localSlots[local] is not { } slots || slots.Length != names.Length) continue;
+                int whole = _localInner[local] >= 0 ? _localInner[local] : _localRegion[local];
+                for (int k = 0; k < slots.Length; k++)
+                {
+                    slots[k] = Universal(names[k]);
+                    if (whole >= 0) DeclareOutlives(slots[k], whole);
+                }
+            }
+            if (sig.OutputSlots is { } outNames && _localSlots[0] is { } outSlots && outSlots.Length == outNames.Length)
+                for (int k = 0; k < outSlots.Length; k++) outSlots[k] = Universal(outNames[k]);
 
             // '#data: what a ref struct or reference returns lives as long as what it points at.
             if (sig.Output == "'#data" && _b.ArgCount > 0 && _localInner[1] >= 0) returnRegion = _localInner[1];
@@ -838,11 +913,22 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                                 Outlives(data, destInner >= 0 ? destInner : dest, a.Syntax);
                                 if (destInner >= 0 && r.Mode == RefMode.Mut) Outlives(destInner, data, a.Syntax);
                             }
-                            if (r.Place.Static is null && PassesRefDeref(r.Place)) Outlives(_localRegion[r.Place.Local], dest, a.Syntax);
-                            // A reference field borrows for the struct's implicit lifetime: through `ref View t`,
-                            // `ref t.P[0]` must not outlive what v borrows either (Rust's supporting prefixes).
-                            if (r.Place.Static is null && DerefsReferenceFieldBehindReference(r.Place))
+                            if (r.Place.Static is null && PassesRefDeref(r.Place) && !ThroughSharedSlotField(r.Place)) Outlives(_localRegion[r.Place.Local], dest, a.Syntax);
+                            // Rust's supporting prefixes: a reborrow through a reference field lives no longer
+                            // than that field's lifetime; through a shared one, that is all it depends on.
+                            if (r.Place.Static is null && PassesRefDeref(r.Place) && SlotField(r.Place, out _) is int fieldSlot and >= 0)
+                                Outlives(_localSlots[r.Place.Local][fieldSlot], dest, a.Syntax);
+                            // Without a lifetime parameter, a reference field borrows for the struct's one implicit
+                            // lifetime: through `ref View t`, `ref t.P[0]` must not outlive what v borrows either.
+                            else if (r.Place.Static is null && DerefsReferenceFieldBehindReference(r.Place))
                                 Outlives(_localInner[r.Place.Local], dest, a.Syntax);
+                            // `&p` for a Pair<'a, 'b>: the reference sees the same slots; `&mut` may also store, so it is invariant.
+                            if (SlotsOf(r.Place) is { } from && SlotsOf(a.Dest) is { } to && from.Length == to.Length)
+                                for (int k = 0; k < from.Length; k++)
+                                {
+                                    Outlives(from[k], to[k], a.Syntax);
+                                    if (r.Mode == RefMode.Mut) Outlives(to[k], from[k], a.Syntax);
+                                }
                             // Remember what a receiver borrows, for the content lifetime of containers.
                             if (a.Dest.IsLocal && r.Place.Static is null && r.Place.Projs.All(x => x is DerefProj)) _refSource[a.Dest.Local] = r.Place.Local;
                             if (NeedsLoan(r.Place))
@@ -946,9 +1032,33 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
 
             foreach (var (longer, shorter) in sig.Bounds) Outlives(Fresh(longer), Fresh(shorter), c.Syntax);
 
+            // Lifetime parameters: each slot of an argument outlives the lifetime its parameter names;
+            // through `ref` (or a constructor's `this`) the callee may store into it, so the slot is invariant.
+            for (int i = 0; sig.InputSlots != null && i < c.Args.Count && i < sig.InputSlots.Length; i++)
+            {
+                if (sig.InputSlots[i] is not { } names || SlotsOf(c.Args[i]) is not { } slots || slots.Length != names.Length) continue;
+                var argPlace = c.Args[i] is CopyOp cp ? cp.Place : ((MoveOp)c.Args[i]).Place;
+                bool invariant = _b.TypeOf(argPlace).Ref == RefMode.Mut;
+                for (int k = 0; k < slots.Length; k++)
+                {
+                    Outlives(slots[k], Fresh(names[k]), c.Syntax);
+                    if (invariant) Outlives(Fresh(names[k]), slots[k], c.Syntax);
+                }
+            }
+
             if (c.Dest is null) return;
             int dest = RegionOf(c.Dest);
             int destInner = c.Dest.IsLocal ? _localInner[c.Dest.Local] : -1;
+
+            if (sig.OutputSlots is { } outNames && SlotsOf(c.Dest) is { } outSlots && outSlots.Length == outNames.Length)
+                for (int k = 0; k < outSlots.Length; k++) Outlives(Fresh(outNames[k]), outSlots[k], c.Syntax);
+
+            // A result named after an input's slot (`ref readonly 'a int First(in Pair<'a, 'b> p)`) lives for that slot.
+            if (sig.IsSlotName(sig.Output))
+            {
+                Outlives(Fresh(sig.Output), dest, c.Syntax);
+                Outlives(Fresh(sig.Output), destInner, c.Syntax);
+            }
 
             // What comes out of a container (an element, an enumerator, a reference to an element)
             // is usable only while its content lives.

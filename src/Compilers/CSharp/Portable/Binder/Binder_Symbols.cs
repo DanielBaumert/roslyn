@@ -424,10 +424,10 @@ namespace Microsoft.CodeAnalysis.CSharp
                     return bindPredefined();
 
                 case SyntaxKind.IdentifierName:
-                    return BindNonGenericSimpleNamespaceOrTypeOrAliasSymbol((IdentifierNameSyntax)syntax, diagnostics, basesBeingResolved, suppressUseSiteDiagnostics, qualifierOpt: null);
+                    return CheckLifetimeArguments((SimpleNameSyntax)syntax, BindNonGenericSimpleNamespaceOrTypeOrAliasSymbol((IdentifierNameSyntax)syntax, diagnostics, basesBeingResolved, suppressUseSiteDiagnostics, qualifierOpt: null), diagnostics);
 
                 case SyntaxKind.GenericName:
-                    return BindGenericSimpleNamespaceOrTypeOrAliasSymbol((GenericNameSyntax)syntax, diagnostics, basesBeingResolved, qualifierOpt: null);
+                    return CheckLifetimeArguments((SimpleNameSyntax)syntax, BindGenericSimpleNamespaceOrTypeOrAliasSymbol((GenericNameSyntax)syntax, diagnostics, basesBeingResolved, qualifierOpt: null), diagnostics);
 
                 case SyntaxKind.AliasQualifiedName:
                     return bindAlias();
@@ -849,11 +849,24 @@ namespace Microsoft.CodeAnalysis.CSharp
                     return TypeWithAnnotations.Create(new ExtendedErrorTypeSymbol(qualifierOpt ?? this.Compilation.Assembly.GlobalNamespace, string.Empty, arity: 0, errorInfo: null));
 
                 case SyntaxKind.IdentifierName:
-                    return BindNonGenericSimpleNamespaceOrTypeOrAliasSymbol((IdentifierNameSyntax)syntax, diagnostics, basesBeingResolved, suppressUseSiteDiagnostics, qualifierOpt);
+                    return CheckLifetimeArguments((SimpleNameSyntax)syntax, BindNonGenericSimpleNamespaceOrTypeOrAliasSymbol((IdentifierNameSyntax)syntax, diagnostics, basesBeingResolved, suppressUseSiteDiagnostics, qualifierOpt), diagnostics);
 
                 case SyntaxKind.GenericName:
-                    return BindGenericSimpleNamespaceOrTypeOrAliasSymbol((GenericNameSyntax)syntax, diagnostics, basesBeingResolved, qualifierOpt);
+                    return CheckLifetimeArguments((SimpleNameSyntax)syntax, BindGenericSimpleNamespaceOrTypeOrAliasSymbol((GenericNameSyntax)syntax, diagnostics, basesBeingResolved, qualifierOpt), diagnostics);
             }
+        }
+
+        /// <summary>
+        /// RustSharp: lifetime arguments (`Pair&lt;'a, 'b&gt;`) are erased before binding. Their number must match what
+        /// the type declares, like Rust's E0107, so that none is ignored silently.
+        /// </summary>
+        private NamespaceOrTypeOrAliasSymbolWithAnnotations CheckLifetimeArguments(SimpleNameSyntax syntax, NamespaceOrTypeOrAliasSymbolWithAnnotations result, BindingDiagnosticBag diagnostics)
+        {
+            if (!IsNullFree(syntax) || result.NamespaceOrTypeSymbol is not TypeSymbol { TypeKind: not TypeKind.Error } type) return result;
+            int written = Ownership.Lifetimes.Arguments(syntax).Count;
+            int declared = Ownership.Lifetimes.Declared(type).Length;
+            if (written != 0 && written != declared) Error(diagnostics, ErrorCode.ERR_OwnLifetimeArity, syntax, type, declared, written);
+            return result;
         }
 
         protected NamespaceOrTypeOrAliasSymbolWithAnnotations BindNonGenericSimpleNamespaceOrTypeOrAliasSymbol(

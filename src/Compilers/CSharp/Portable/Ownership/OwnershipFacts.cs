@@ -24,6 +24,15 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         public bool MissingSpecifier;
         /// <summary>Declared `where 'a : 'b` relations.</summary>
         public List<(string Longer, string Shorter)> Bounds = new List<(string, string)>();
+        /// <summary>
+        /// Lifetime parameters: per input, one name per slot of its type (<c>['a, 'b]</c> for <c>in Pair&lt;'a, 'b&gt;</c>),
+        /// or null when the type declares no lifetimes. For `this`, the names the type declares.
+        /// </summary>
+        public string[][] InputSlots;
+        /// <summary>One name per slot of the result's type, or null.</summary>
+        public string[] OutputSlots;
+        /// <summary>Whether a name is the lifetime of some input's slot, such as <c>'a</c> in <c>First(in Pair&lt;'a, 'b&gt;)</c>.</summary>
+        public bool IsSlotName(string name) => name != null && InputSlots != null && InputSlots.Any(s => s != null && System.Array.IndexOf(s, name) >= 0);
     }
 
     internal static class OwnershipFacts
@@ -404,6 +413,17 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
 
             var sig = new LifetimeSig { Inputs = inputs.ToArray() };
 
+            // Lifetime parameters of the inputs' and the result's types, one name per slot.
+            sig.InputSlots = new string[sig.Inputs.Length][];
+            int first = m.IsStatic ? 0 : 1;
+            if (!m.IsStatic && Lifetimes.Declared(m.ContainingType) is { IsEmpty: false } own) sig.InputSlots[0] = own.ToArray();
+            for (int i = 0; i < m.ParameterCount; i++)
+            {
+                var typeSyntax = paramList != null && i < paramList.Parameters.Count ? paramList.Parameters[i].Type : null;
+                sig.InputSlots[first + i] = Lifetimes.Slots(m.Parameters[i].Type, typeSyntax, i.ToString());
+            }
+            sig.OutputSlots = Lifetimes.Slots(m.ReturnType, (decl as MethodDeclarationSyntax)?.ReturnType, "ret");
+
             // The parser keeps `where 'a : 'b` as skipped tokens behind the parameter list.
             if (paramList != null)
             {
@@ -415,11 +435,13 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 for (int i = 0; i + 1 < names.Count; i += 2) sig.Bounds.Add((names[i], names[i + 1]));
             }
 
-            // A ref-struct constructor stores its arguments: they all share the lifetime of `this`.
+            // A ref-struct constructor stores its arguments: they all share the lifetime of `this`. With
+            // lifetime parameters, an argument named after one (`ref readonly 'a int x`) goes to that slot.
             if (m.MethodKind == MethodKind.Constructor && IsBorrowHolder(m.ContainingType))
             {
+                var slots = sig.InputSlots[0];
                 for (int i = 0; i < sig.Inputs.Length; i++)
-                    if (sig.Inputs[i] != null) sig.Inputs[i] = "'#this";
+                    if (sig.Inputs[i] != null && (slots is null || System.Array.IndexOf(slots, sig.Inputs[i]) < 0)) sig.Inputs[i] = "'#this";
                 return sig;
             }
 

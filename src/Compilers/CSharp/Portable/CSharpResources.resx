@@ -8286,6 +8286,9 @@ To remove the warning, you can use /reference instead (set the Embed Interop Typ
   <data name="ERR_OwnNoNullOperator" xml:space="preserve">
     <value>`{0}` works on null, and there is no null: {1}</value>
   </data>
+  <data name="ERR_OwnLifetimeArity" xml:space="preserve">
+    <value>`{0}` declares {1} lifetime parameter(s), but {2} lifetime argument(s) were written</value>
+  </data>
   <data name="ERR_OwnNullDefault" xml:space="preserve">
     <value>{0} would hold null, and there is no null: `{1}` has no value of its own. {2}</value>
   </data>
