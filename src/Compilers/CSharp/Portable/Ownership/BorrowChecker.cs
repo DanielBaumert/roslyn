@@ -690,6 +690,18 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (src.IsLocal && dest.IsLocal) Outlives(_localInner[src.Local], _localInner[dest.Local], syntax);
         }
 
+        /// <summary>
+        /// Whether a place, rooted at a reference to a borrow holder, dereferences a reference stored in one of
+        /// its fields: <c>*((*t).P)</c> for <c>ref View t</c>. What that reaches lives for the holder's data.
+        /// </summary>
+        private bool DerefsReferenceFieldBehindReference(Place p)
+        {
+            if (_localInner[p.Local] < 0 || p.Projs.Length < 3 || p.Projs[0] is not DerefProj) return false;
+            for (int i = 1; i + 1 < p.Projs.Length; i++)
+                if (p.Projs[i] is FieldProj { Field.RefKind: not RefKind.None } && p.Projs[i + 1] is DerefProj) return true;
+            return false;
+        }
+
         /// <summary>A loan is pointless behind a shared reference or a raw pointer.</summary>
         private bool NeedsLoan(Place p)
         {
@@ -827,6 +839,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                                 if (destInner >= 0 && r.Mode == RefMode.Mut) Outlives(destInner, data, a.Syntax);
                             }
                             if (r.Place.Static is null && PassesRefDeref(r.Place)) Outlives(_localRegion[r.Place.Local], dest, a.Syntax);
+                            // A reference field borrows for the struct's implicit lifetime: through `ref View t`,
+                            // `ref t.P[0]` must not outlive what v borrows either (Rust's supporting prefixes).
+                            if (r.Place.Static is null && DerefsReferenceFieldBehindReference(r.Place))
+                                Outlives(_localInner[r.Place.Local], dest, a.Syntax);
                             // Remember what a receiver borrows, for the content lifetime of containers.
                             if (a.Dest.IsLocal && r.Place.Static is null && r.Place.Projs.All(x => x is DerefProj)) _refSource[a.Dest.Local] = r.Place.Local;
                             if (NeedsLoan(r.Place))
