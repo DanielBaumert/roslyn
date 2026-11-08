@@ -221,7 +221,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
                 {
                     diagnostics.Add(ErrorCode.ERR_RefExtensionMustBeValueTypeOrConstrainedToOne, _location, Name);
                 }
-                else if (parameter0RefKind is RefKind.In or RefKind.RefReadOnlyParameter && parameter0Type.TypeKind != TypeKind.Struct)
+                else if (parameter0RefKind is RefKind.In or RefKind.RefReadOnlyParameter && parameter0Type.TypeKind != TypeKind.Struct && ((CSharpParseOptions?)_location.SourceTree?.Options)?.IsOwnershipEnabled != true)
                 {
                     diagnostics.Add(ErrorCode.ERR_InExtensionMustBeValueType, _location, Name);
                 }
@@ -779,7 +779,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
 
             allowedModifiers |= DeclarationModifiers.Async | DeclarationModifiers.Extern;
 
-            if (containingType.IsStructType())
+            if (containingType.IsStructType() || ((CSharpParseOptions?)location.SourceTree?.Options)?.IsOwnershipEnabled == true)
             {
                 allowedModifiers |= DeclarationModifiers.ReadOnly;
             }

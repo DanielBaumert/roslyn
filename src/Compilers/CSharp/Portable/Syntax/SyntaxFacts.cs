@@ -416,6 +416,7 @@ namespace Microsoft.CodeAnalysis.CSharp
                 case PostDecrementExpression:
                 case PreIncrementExpression:
                 case PreDecrementExpression:
+                case PropagateExpression: // RustSharp: `f()?;`
                 case AwaitExpression:
                     return true;
 

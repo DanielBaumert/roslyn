@@ -116,6 +116,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
         internal override void GenerateMethodBody(TypeCompilationState compilationState, BindingDiagnosticBag diagnostics)
         {
             var F = new SyntheticBoundNodeFactory(this, ContainingType.GetNonNullSyntaxNode(), compilationState, diagnostics);
+            if (ContainingType.GetNonNullSyntaxNode().SyntaxTree.Options is CSharpParseOptions { IsOwnershipEnabled: true })
+            {
+                // RustSharp: the native backend derives printing; this body is never compiled.
+                F.CloseMethod(F.Return(F.Literal(false)));
+                return;
+            }
             try
             {
                 ImmutableArray<Symbol> printableMembers = ContainingType.GetMembers().WhereAsArray(m => isPrintable(m));

@@ -421,6 +421,7 @@ namespace Microsoft.CodeAnalysis.CSharp
             bool hasErrors,
             BindingDiagnosticBag diagnostics)
         {
+            if (IsOptionNone(expression, inputType)) return BindOptionTest(node, inputType, some: false, diagnostics);
             ExpressionSyntax innerExpression = SkipParensAndNullSuppressions(expression, diagnostics, ref hasErrors);
             var convertedExpression = BindExpressionOrTypeForPattern(inputType, innerExpression, ref hasErrors, diagnostics, out var constantValueOpt, out bool wasExpression, out Conversion patternConversion);
             if (wasExpression)
@@ -954,6 +955,36 @@ namespace Microsoft.CodeAnalysis.CSharp
                 (declContainer.ContainingSymbol as NamespaceSymbol)?.IsGlobalNamespace == true;
         }
 
+        /// <summary>RustSharp: an Option&lt;T&gt; is matched like Rust's: `Some(var v)` and `None`.</summary>
+        private static bool IsOption(TypeSymbol inputType)
+            => inputType is NamedTypeSymbol { Name: "Option", Arity: 1, ContainingNamespace: { Name: "System", ContainingNamespace.IsGlobalNamespace: true } };
+
+        private bool IsOptionSome(RecursivePatternSyntax node, TypeSymbol inputType)
+            => node is { Type: IdentifierNameSyntax { Identifier.ValueText: "Some" }, PositionalPatternClause.Subpatterns.Count: 1, PropertyPatternClause: null, Designation: null }
+                && ((CSharpParseOptions)node.SyntaxTree.Options).IsOwnershipEnabled && IsOption(inputType);
+
+        private static bool IsOptionNone(ExpressionSyntax expression, TypeSymbol inputType)
+            => expression is IdentifierNameSyntax { Identifier.ValueText: "None" }
+                    or MemberAccessExpressionSyntax { Name: IdentifierNameSyntax { Identifier.ValueText: "None" }, Expression: GenericNameSyntax { Identifier.ValueText: "Option" } or QualifiedNameSyntax { Right: GenericNameSyntax { Identifier.ValueText: "Option" } } }
+                && ((CSharpParseOptions)expression.SyntaxTree.Options).IsOwnershipEnabled && IsOption(inputType);
+
+        /// <summary>`{ IsSome: true }` or `{ IsSome: false }` on an Option&lt;T&gt;.</summary>
+        private BoundPattern BindOptionTest(SyntaxNode syntax, TypeSymbol inputType, bool some, BindingDiagnosticBag diagnostics)
+        {
+            var boolType = GetSpecialType(SpecialType.System_Boolean, diagnostics, syntax);
+            var isSome = inputType.GetMembers("IsSome").OfType<PropertySymbol>().FirstOrDefault();
+            bool hasErrors = isSome is null;
+            if (hasErrors) Error(diagnostics, ErrorCode.ERR_NoSuchMember, syntax, inputType, "IsSome");
+            var constant = ConstantValue.Create(some);
+            var test = new BoundConstantPattern(syntax, new BoundLiteral(syntax, constant, boolType) { WasCompilerGenerated = true }, constant, boolType, boolType)
+            { WasCompilerGenerated = true };
+            var member = new BoundPropertySubpatternMember(syntax, receiver: null, isSome, boolType, hasErrors);
+            var property = new BoundPropertySubpattern(syntax, member, isLengthOrCount: false, test);
+            return new BoundRecursivePattern(syntax, declaredType: null, deconstructMethod: null, deconstruction: default,
+                properties: ImmutableArray.Create(property), isExplicitNotNullTest: false, variable: null, variableAccess: null,
+                inputType: inputType, narrowedType: inputType, hasErrors) { WasCompilerGenerated = true };
+        }
+
         private BoundPattern BindRecursivePattern(
             RecursivePatternSyntax node,
             TypeSymbol inputType,
@@ -971,7 +1002,11 @@ namespace Microsoft.CodeAnalysis.CSharp
             }
 
             TypeSyntax? typeSyntax = node.Type;
-            TypeWithAnnotations declTypeWithAnnotations = BindRecursivePatternType(typeSyntax, inputType, diagnostics, ref hasErrors, out BoundTypeExpression? boundDeclType);
+            bool optionSome = IsOptionSome(node, inputType);
+            BoundTypeExpression? boundDeclType = null;
+            TypeWithAnnotations declTypeWithAnnotations = optionSome
+                ? TypeWithAnnotations.Create(inputType)
+                : BindRecursivePatternType(typeSyntax, inputType, diagnostics, ref hasErrors, out boundDeclType);
             TypeSymbol declType = declTypeWithAnnotations.Type;
 
             MethodSymbol? deconstructMethod = null;
@@ -1028,6 +1063,17 @@ namespace Microsoft.CodeAnalysis.CSharp
             if (node.PropertyPatternClause != null)
             {
                 properties = BindPropertyPatternClause(node.PropertyPatternClause, declType, permitDesignations, diagnostics, ref hasErrors);
+            }
+
+            if (optionSome)
+            {
+                // `Some(p)` is `{ IsSome: true } and Option<T>(p)`: the Deconstruct runs only once IsSome held.
+                var value = new BoundRecursivePattern(
+                    syntax: node.PositionalPatternClause!, declaredType: null, deconstructMethod: deconstructMethod,
+                    deconstruction: deconstructionSubpatterns, properties: default, isExplicitNotNullTest: false,
+                    variable: null, variableAccess: null, inputType: inputType, narrowedType: inputType, hasErrors);
+                return new BoundBinaryPattern(node, disjunction: false, BindOptionTest(node.Type!, inputType, some: true, diagnostics), value,
+                    inputType: inputType, narrowedType: inputType, hasErrors);
             }
 
             BindPatternDesignation(

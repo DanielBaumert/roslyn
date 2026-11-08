@@ -1009,20 +1009,30 @@ public sealed partial class RefTypeSyntax : TypeSyntax
         }
     }
 
-    public TypeSyntax Type => GetRed(ref this.type, 2)!;
+    /// <summary>RustSharp: gets the optional lifetime, e.g. 'a.</summary>
+    public SyntaxToken LifetimeToken
+    {
+        get
+        {
+            var slot = ((Syntax.InternalSyntax.RefTypeSyntax)this.Green).lifetimeToken;
+            return slot != null ? new SyntaxToken(this, slot, GetChildPosition(2), GetChildIndex(2)) : default;
+        }
+    }
 
-    internal override SyntaxNode? GetNodeSlot(int index) => index == 2 ? GetRed(ref this.type, 2)! : null;
+    public TypeSyntax Type => GetRed(ref this.type, 3)!;
 
-    internal override SyntaxNode? GetCachedSlot(int index) => index == 2 ? this.type : null;
+    internal override SyntaxNode? GetNodeSlot(int index) => index == 3 ? GetRed(ref this.type, 3)! : null;
+
+    internal override SyntaxNode? GetCachedSlot(int index) => index == 3 ? this.type : null;
 
     public override void Accept(CSharpSyntaxVisitor visitor) => visitor.VisitRefType(this);
     public override TResult? Accept<TResult>(CSharpSyntaxVisitor<TResult> visitor) where TResult : default => visitor.VisitRefType(this);
 
-    public RefTypeSyntax Update(SyntaxToken refKeyword, SyntaxToken readOnlyKeyword, TypeSyntax type)
+    public RefTypeSyntax Update(SyntaxToken refKeyword, SyntaxToken readOnlyKeyword, SyntaxToken lifetimeToken, TypeSyntax type)
     {
-        if (refKeyword != this.RefKeyword || readOnlyKeyword != this.ReadOnlyKeyword || type != this.Type)
+        if (refKeyword != this.RefKeyword || readOnlyKeyword != this.ReadOnlyKeyword || lifetimeToken != this.LifetimeToken || type != this.Type)
         {
-            var newNode = SyntaxFactory.RefType(refKeyword, readOnlyKeyword, type);
+            var newNode = SyntaxFactory.RefType(refKeyword, readOnlyKeyword, lifetimeToken, type);
             var annotations = GetAnnotations();
             return annotations?.Length > 0 ? newNode.WithAnnotations(annotations) : newNode;
         }
@@ -1030,9 +1040,10 @@ public sealed partial class RefTypeSyntax : TypeSyntax
         return this;
     }
 
-    public RefTypeSyntax WithRefKeyword(SyntaxToken refKeyword) => Update(refKeyword, this.ReadOnlyKeyword, this.Type);
-    public RefTypeSyntax WithReadOnlyKeyword(SyntaxToken readOnlyKeyword) => Update(this.RefKeyword, readOnlyKeyword, this.Type);
-    public RefTypeSyntax WithType(TypeSyntax type) => Update(this.RefKeyword, this.ReadOnlyKeyword, type);
+    public RefTypeSyntax WithRefKeyword(SyntaxToken refKeyword) => Update(refKeyword, this.ReadOnlyKeyword, this.LifetimeToken, this.Type);
+    public RefTypeSyntax WithReadOnlyKeyword(SyntaxToken readOnlyKeyword) => Update(this.RefKeyword, readOnlyKeyword, this.LifetimeToken, this.Type);
+    public RefTypeSyntax WithLifetimeToken(SyntaxToken lifetimeToken) => Update(this.RefKeyword, this.ReadOnlyKeyword, lifetimeToken, this.Type);
+    public RefTypeSyntax WithType(TypeSyntax type) => Update(this.RefKeyword, this.ReadOnlyKeyword, this.LifetimeToken, type);
 }
 
 /// <summary>The 'scoped' modifier of a local.</summary>
@@ -1307,6 +1318,7 @@ public sealed partial class AwaitExpressionSyntax : ExpressionSyntax
 /// <item><description><see cref="SyntaxKind.PostIncrementExpression"/></description></item>
 /// <item><description><see cref="SyntaxKind.PostDecrementExpression"/></description></item>
 /// <item><description><see cref="SyntaxKind.SuppressNullableWarningExpression"/></description></item>
+/// <item><description><see cref="SyntaxKind.PropagateExpression"/></description></item>
 /// </list>
 /// </remarks>
 public sealed partial class PostfixUnaryExpressionSyntax : ExpressionSyntax

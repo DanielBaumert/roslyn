@@ -592,6 +592,11 @@ namespace Microsoft.CodeAnalysis.CSharp
         /// </remarks>
         private static MethodSymbol GetBaseTypeFinalizeMethod(MethodSymbol method)
         {
+            if (method.ContainingType.IsValueType)
+            {
+                return null; // RustSharp: struct destructors have no base to chain to.
+            }
+
             NamedTypeSymbol baseType = method.ContainingType.BaseTypeNoUseSiteDiagnostics;
             while ((object)baseType != null)
             {

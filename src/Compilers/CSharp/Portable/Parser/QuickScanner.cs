@@ -191,6 +191,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
 
         private SyntaxToken? QuickScanSyntaxToken()
         {
+            // RustSharp: the fast path knows no contextual trivia such as `mut`.
+            if (_options.IsOwnershipEnabled) return null;
+
             this.Start();
             var state = QuickScanState.Initial;
 

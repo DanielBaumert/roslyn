@@ -660,6 +660,7 @@ namespace Microsoft.CodeAnalysis.CSharp
                     case SyntaxKind.CoalesceExpression:
                         return BindNullCoalescingOperator((BinaryExpressionSyntax)node, diagnostics);
                     case SyntaxKind.ConditionalAccessExpression:
+                        if (TryBindPropagatingAccess((ConditionalAccessExpressionSyntax)node, diagnostics) is { } propagating) return propagating;
                         return BindConditionalAccessExpression((ConditionalAccessExpressionSyntax)node, diagnostics);
 
                     case SyntaxKind.MemberBindingExpression:
@@ -712,6 +713,13 @@ namespace Microsoft.CodeAnalysis.CSharp
                     case SyntaxKind.TrueLiteralExpression:
                     case SyntaxKind.FalseLiteralExpression:
                     case SyntaxKind.NullLiteralExpression:
+                        if (node.Kind() == SyntaxKind.NullLiteralExpression && IsNullFree(node) && !InUnsafeRegion)
+                        {
+                            // RustSharp: Rust has no null. A missing value is Option<T>::None. Unsafe code keeps
+                            // null pointers (Rust's ptr::null); a null reference there is still a nullable error.
+                            Error(diagnostics, ErrorCode.ERR_OwnNoNull, node);
+                            return BadExpression(node);
+                        }
                         return BindLiteralConstant((LiteralExpressionSyntax)node, diagnostics);
 
                     case SyntaxKind.Utf8StringLiteralExpression:
@@ -831,6 +839,9 @@ namespace Microsoft.CodeAnalysis.CSharp
 
                     case SyntaxKind.SuppressNullableWarningExpression:
                         return BindSuppressNullableWarningExpression((PostfixUnaryExpressionSyntax)node, diagnostics);
+
+                    case SyntaxKind.PropagateExpression:
+                        return BindPropagateExpression((PostfixUnaryExpressionSyntax)node, diagnostics);
 
                     case SyntaxKind.WithExpression:
                         return BindWithExpression((WithExpressionSyntax)node, diagnostics);
@@ -11327,6 +11338,55 @@ namespace Microsoft.CodeAnalysis.CSharp
 
             Location getErrorLocation()
                 => location ?? GetAnonymousFunctionLocation(node);
+        }
+
+        /// <summary>
+        /// RustSharp: on a Result or an Option, `x?.M()` is Rust's `x?.m()`: propagate, then access the value.
+        /// It binds as <c>{ var t = x?; t.M() }</c>.
+        /// </summary>
+        /// <summary>RustSharp: there is no null, in the program and in the core library alike. Only unsafe code keeps null pointers.</summary>
+        internal static bool IsNullFree(SyntaxNode node) => node.SyntaxTree?.Options is CSharpParseOptions { IsOwnershipEnabled: true };
+
+        private BoundExpression? TryBindPropagatingAccess(ConditionalAccessExpressionSyntax node, BindingDiagnosticBag diagnostics)
+        {
+            if (!((CSharpParseOptions)node.SyntaxTree.Options).IsOwnershipEnabled) return null;
+            // Bound once into a bag of its own: binding an `await` twice does not give its type the second time.
+            var probe = BindingDiagnosticBag.GetInstance(diagnostics);
+            var operand = BindRValueWithoutTargetType(node.Expression, probe);
+            var receiverType = operand.Type;
+            if (receiverType is not NamedTypeSymbol { ContainingNamespace.Name: "System" } wrapper
+                || (wrapper.Name, wrapper.Arity) is not (("Result", 2) or ("Option", 1)))
+            {
+                probe.Free();
+                if (receiverType is null || receiverType.IsErrorType() || !IsNullFree(node)) return null;
+                // A reference is never null, so there is nothing for `?.` to skip.
+                Error(diagnostics, ErrorCode.ERR_OwnNoNullOperator, node.OperatorToken, "?.",
+                    $"`{receiverType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)}` always has a value, so write `.`. A value that may be missing is an Option<T>, where `x?.M()` passes None on");
+                return BadExpression(node);
+            }
+
+            diagnostics.AddRangeAndFree(probe);
+            // The receiver's syntax without parentheses, or `(await x)?.M()` would bind `(await x)` again.
+            var value = BindPropagate(GetConditionalReceiverSyntax(node), operand, diagnostics);
+            if (value.HasAnyErrors || value.Type is null) return value;
+
+            var temp = new SynthesizedLocal(ContainingMemberOrLambda as MethodSymbol, TypeWithAnnotations.Create(value.Type), SynthesizedLocalKind.LoweringTemp);
+            var local = new BoundLocal(node.Expression, temp, constantValueOpt: null, value.Type) { WasCompilerGenerated = true };
+            var binder = new BinderWithConditionalReceiver(this, value);
+            var access = binder.BindValue(node.WhenNotNull, diagnostics, BindValueKind.RValue);
+            access = (BoundExpression)new ConditionalReceiverReplacer(local).Visit(access);
+            var store = new BoundAssignmentOperator(node.Expression, local, value, value.Type) { WasCompilerGenerated = true };
+            return new BoundSequence(node, ImmutableArray.Create<LocalSymbol>(temp), ImmutableArray.Create<BoundExpression>(store), access, access.Type ?? CreateErrorType());
+        }
+
+        private sealed class ConditionalReceiverReplacer : BoundTreeRewriterWithStackGuard
+        {
+            private readonly BoundExpression _replacement;
+            public ConditionalReceiverReplacer(BoundExpression replacement) { _replacement = replacement; }
+            public override BoundNode? VisitConditionalReceiver(BoundConditionalReceiver node) => _replacement;
+            // A nested `?.` has receivers of its own.
+            public override BoundNode? VisitConditionalAccess(BoundConditionalAccess node)
+                => node.Update((BoundExpression)Visit(node.Receiver), node.AccessExpression, node.Type);
         }
 
         private BoundConditionalAccess BindConditionalAccessExpression(ConditionalAccessExpressionSyntax node, BindingDiagnosticBag diagnostics)

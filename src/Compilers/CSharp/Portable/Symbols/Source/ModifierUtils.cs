@@ -403,6 +403,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
                     return DeclarationModifiers.Scoped;
                 case SyntaxKind.FileKeyword:
                     return DeclarationModifiers.File;
+                case SyntaxKind.LifetimeToken:
+                case SyntaxKind.MoveKeyword:
+                    // RustSharp: read from syntax by the ownership analysis, no symbol-level meaning.
+                    return DeclarationModifiers.None;
                 default:
                     throw ExceptionUtilities.UnexpectedValue(kind);
             }

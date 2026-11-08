@@ -1,0 +1,1450 @@
+// RustSharp: the ownership and borrow checker. Three stages over MIR:
+//   1. static rules: where a move may come from, and what may be written through a shared reference
+//   2. move analysis: forward "maybe moved" dataflow over move paths
+//   3. non-lexical lifetimes: liveness-based region inference, then loan conflict detection
+// Every borrow-carrying local has one region, and a reference to a ref struct has a second one for
+// the data behind it: `&'x mut View<'y>`. Two levels are enough because C# only allows `ref` and ref
+// structs to hold borrows, and those cannot nest arbitrarily the way Rust's reference types can.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.CodeAnalysis.CSharp.Symbols;
+
+namespace Microsoft.CodeAnalysis.CSharp.Ownership
+{
+    internal sealed class Bits
+    {
+        private readonly ulong[] _w;
+        public Bits(int n) => _w = new ulong[(n + 63) / 64];
+        private Bits(ulong[] w) => _w = w;
+        public Bits Clone() => new Bits((ulong[])_w.Clone());
+        public bool this[int i]
+        {
+            get => (_w[i >> 6] & (1UL << (i & 63))) != 0;
+            set { if (value) _w[i >> 6] |= 1UL << (i & 63); else _w[i >> 6] &= ~(1UL << (i & 63)); }
+        }
+
+        public bool UnionWith(Bits o)
+        {
+            bool changed = false;
+            for (int i = 0; i < _w.Length; i++)
+            {
+                var v = _w[i] | o._w[i];
+                if (v != _w[i]) { _w[i] = v; changed = true; }
+            }
+            return changed;
+        }
+
+        public IEnumerable<int> Ones()
+        {
+            for (int i = 0; i < _w.Length; i++)
+            {
+                var v = _w[i];
+                while (v != 0)
+                {
+                    int b = System.Numerics.BitOperations.TrailingZeroCount(v);
+                    yield return i * 64 + b;
+                    v &= v - 1;
+                }
+            }
+        }
+    }
+
+    internal sealed class BorrowChecker
+    {
+        private enum Access { Copy, Move, Assign, Drop, StorageDead, BorrowShared, BorrowMut }
+
+        private sealed class Loan
+        {
+            public int Index, Point, Region;
+            public Place Place;
+            public RefMode Mode;
+            public SyntaxNode Syntax;
+        }
+
+        private readonly MirBody _b;
+        private readonly List<OwnershipDiagnostic> _out;
+        private readonly HashSet<(ErrorCode, Location)> _seen = new HashSet<(ErrorCode, Location)>();
+        private readonly List<BasicBlock> _blocks;
+        private readonly Dictionary<BasicBlock, int> _start = new Dictionary<BasicBlock, int>();
+        private readonly Dictionary<BasicBlock, List<BasicBlock>> _preds = new Dictionary<BasicBlock, List<BasicBlock>>();
+        private readonly int _points;
+
+        private BorrowChecker(MirBody body, List<OwnershipDiagnostic> diagnostics)
+        {
+            _b = body;
+            _out = diagnostics;
+            _blocks = body.Reachable();
+            int p = 0;
+            foreach (var b in _blocks)
+            {
+                _start[b] = p;
+                p += b.Statements.Count + 1;
+                _preds[b] = new List<BasicBlock>();
+            }
+            _points = p;
+            foreach (var b in _blocks)
+                foreach (var s in b.Term.Successors.Distinct())
+                    _preds[s].Add(b);
+        }
+
+        public static void Check(MirBody body, List<OwnershipDiagnostic> diagnostics)
+        {
+            // Never called: readers of an owned auto-property use the backing field directly.
+            if (OwnershipFacts.OwnedAutoPropertyField(body.Method) is not null) return;
+
+            var c = new BorrowChecker(body, diagnostics);
+            c.CheckSignature();
+            c.StaticRules();
+            c.MoveAnalysis();
+            c.Nll();
+        }
+
+        private void Report(ErrorCode code, string message, SyntaxNode syntax, string label, Action<OwnershipDiagnostic> extra = null)
+        {
+            var location = (syntax ?? _b.Syntax).Location;
+            if (!_seen.Add((code, location))) return;
+            var d = new OwnershipDiagnostic { Code = code, Message = message, Location = location, Label = label };
+            extra?.Invoke(d);
+            _out.Add(d);
+        }
+
+        private void CheckSignature()
+        {
+            var m = _b.Method;
+            if (OwnershipFacts.GetLifetimeSig(m).MissingSpecifier)
+                Report(ErrorCode.ERR_OwnMissingLifetimeSpecifier,
+                    "missing lifetime specifier: the result could borrow from several inputs",
+                    m.GetNonNullSyntaxNode(), "name the source with a lifetime such as `ref 'a`, or mark the other inputs `scoped`");
+
+            if (m.IsOverride && m.OverriddenMethod is { } baseMethod)
+            {
+                CheckReceiverContract(m, baseMethod);
+                CheckLifetimeContract(m, baseMethod);
+            }
+
+            if (!m.IsStatic && m.MethodKind is MethodKind.Ordinary or MethodKind.PropertyGet or MethodKind.PropertySet or MethodKind.ExplicitInterfaceImplementation)
+            {
+                foreach (var iface in m.ContainingType.AllInterfacesNoUseSiteDiagnostics)
+                {
+                    foreach (var slot in iface.GetMembers().OfType<MethodSymbol>())
+                    {
+                        if (Equals(m.ContainingType.FindImplementationForInterfaceMember(slot)?.OriginalDefinition, m.OriginalDefinition))
+                        {
+                            CheckReceiverContract(m, slot);
+                            CheckLifetimeContract(m, slot);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Callers tie the result to the inputs the declaration names. An implementation may borrow from
+        /// fewer of them, never from others.
+        /// </summary>
+        private void CheckLifetimeContract(MethodSymbol m, MethodSymbol declared)
+        {
+            var mine = OwnershipFacts.GetLifetimeSig(m);
+            var theirs = OwnershipFacts.GetLifetimeSig(declared);
+            if (mine.Output is null && !mine.OutputFromAll) return;
+            if (theirs.OutputFromAll || mine.Inputs.Length != theirs.Inputs.Length) return;
+            if (theirs.Output is null && !OwnershipFacts.IsBorrowHolder(declared.ReturnType) && declared.RefKind == RefKind.None) return;
+
+            for (int i = 0; i < mine.Inputs.Length; i++)
+            {
+                bool usesInput = mine.OutputFromAll ? mine.Inputs[i] != null : mine.Inputs[i] == mine.Output;
+                bool allowed = theirs.Inputs[i] == theirs.Output;
+                if (usesInput && !allowed)
+                {
+                    Report(ErrorCode.ERR_OwnLifetimeMismatch, $"lifetime of `{m.Name}` does not match `{declared.ContainingType.Name}.{declared.Name}`",
+                        m.GetNonNullSyntaxNode(), "the result borrows from an input the declaration does not name");
+                    return;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Callers rely on the declared receiver mode. An implementation may promise more (`readonly`
+        /// where mutation was allowed) but never less, and whether `this` is consumed must agree:
+        /// otherwise a caller keeps a value the callee already freed.
+        /// </summary>
+        private void CheckReceiverContract(MethodSymbol m, MethodSymbol declared)
+        {
+            var mine = OwnershipFacts.GetThisMode(m);
+            var theirs = OwnershipFacts.GetThisMode(declared);
+            bool ok = theirs switch
+            {
+                ThisMode.Shared => mine == ThisMode.Shared,
+                ThisMode.Mut => mine is ThisMode.Mut or ThisMode.Shared,
+                ThisMode.Value => mine == ThisMode.Value,
+                _ => true
+            };
+            if (ok) return;
+
+            string required = theirs == ThisMode.Shared ? "`readonly`" : theirs == ThisMode.Value ? "`move`" : "a borrowing method, not `move`";
+            Report(ErrorCode.ERR_OwnReadonlyOverrideMismatch, $"`{m.Name}` must be {required} to match `{declared.ContainingType.Name}.{declared.Name}`",
+                m.GetNonNullSyntaxNode(), "receiver does not match the declaration");
+        }
+
+        // ---- operand walking
+
+        internal static IEnumerable<Operand> Operands(Rvalue r)
+        {
+            switch (r)
+            {
+                case UseRv u: yield return u.Op; break;
+                case BinaryRv b: yield return b.Left; yield return b.Right; break;
+                case UnaryRv u: yield return u.Value; break;
+                case ConvertRv c: yield return c.Value; break;
+                case RefCastRv c: yield return c.Value; break;
+                case NewArrayRv n: foreach (var l in n.Lengths) yield return l; break;
+                case ArrayDimRv a: yield return a.Dimension; break;
+                case StackAllocRv a:
+                    yield return a.Bytes;
+                    if (a.Init != null) foreach (var i in a.Init) yield return i;
+                    break;
+                case BoxRv b: yield return b.Value; break;
+                case UnboxRv b: yield return b.Value; break;
+                case NewDelegateRv d:
+                    if (d.Target != null) yield return d.Target;
+                    if (d.Captures != null) foreach (var c in d.Captures) yield return c;
+                    break;
+            }
+        }
+
+        private static IEnumerable<(Place Place, Access Access, bool Shallow)> Reads(Rvalue r)
+        {
+            foreach (var op in Operands(r))
+            {
+                if (op is CopyOp c) yield return (c.Place, Access.Copy, false);
+                else if (op is MoveOp m) yield return (m.Place, Access.Move, false);
+            }
+            switch (r)
+            {
+                case RefRv x: yield return (x.Place, x.Mode == RefMode.Mut ? Access.BorrowMut : Access.BorrowShared, false); break;
+                case ArrayLenRv a: yield return (a.Array, Access.Copy, true); break;
+                case ArrayDimRv a: yield return (a.Array, Access.Copy, true); break;
+                case IsInstRv i: yield return (i.Place, Access.Copy, true); break;
+                case IsNullRv i: yield return (i.Place, Access.Copy, true); break;
+                case PeekBoxRv i: yield return (i.Place, Access.Copy, true); break;
+                case RetainRv x: yield return (x.Place, Access.Copy, false); break;
+                case StructEqRv e:
+                    yield return (e.Left, Access.Copy, false);
+                    yield return (e.Right, Access.Copy, false);
+                    break;
+            }
+        }
+
+        internal static IEnumerable<Operand> TermOperands(Terminator t)
+        {
+            switch (t)
+            {
+                case BranchTerm b: yield return b.Cond; break;
+                case SwitchTerm s: yield return s.Value; break;
+                case ThrowTerm x: yield return x.Value; break;
+                case CallTerm c:
+                    if (c.FnPtr != null) yield return c.FnPtr;
+                    foreach (var a in c.Args) yield return a;
+                    break;
+            }
+        }
+
+        private static IEnumerable<Place> IndexPlaces(Place p)
+        {
+            foreach (var proj in p.Projs)
+                if (proj is IndexProj i)
+                    foreach (var op in i.Indices)
+                        if (op is CopyOp c) yield return c.Place;
+        }
+
+        // ---- stage 1
+
+        private void StaticRules()
+        {
+            foreach (var b in _blocks)
+            {
+                foreach (var s in b.Statements)
+                {
+                    if (s is not AssignStmt a) continue;
+                    CheckNotThroughShared(a.Dest, a.Syntax, assign: true);
+                    if (a.Value is RefRv { Mode: RefMode.Mut } r) CheckNotThroughShared(r.Place, a.Syntax, assign: false);
+                    CheckStatic(a.Dest, a.Syntax);
+                    foreach (var (place, _, _) in Reads(a.Value)) CheckStatic(place, a.Syntax);
+                    foreach (var op in Operands(a.Value))
+                        if (op is MoveOp m) CheckMoveSource(m.Place, a.Syntax);
+                }
+                foreach (var op in TermOperands(b.Term))
+                {
+                    if (op is MoveOp m) CheckMoveSource(m.Place, b.Term.Syntax);
+                    if (op is CopyOp { Place: var cp }) CheckStatic(cp, b.Term.Syntax);
+                }
+
+                if (b.Term is CallTerm { Method: { Name: "Transmute", ContainingType.Name: "Mem" } } call && !InUnsafeContext(call.Syntax))
+                    Report(ErrorCode.ERR_OwnRequiresUnsafe, "`Mem.Transmute` requires an `unsafe` context", call.Syntax, "reinterprets the bits of a value");
+            }
+        }
+
+        /// <summary>A mutable static is `static mut`: every access is a possible data race.</summary>
+        private void CheckStatic(Place p, SyntaxNode syntax)
+        {
+            if (p.Static is not { } field || field.IsReadOnly || InOwnStaticConstructor(field) || InUnsafeContext(syntax)) return;
+            if (field.ContainingType.OriginalDefinition is SynthesizedClosureEnvironment) return;
+            Report(ErrorCode.ERR_OwnRequiresUnsafe, $"access to mutable static `{field.Name}` requires an `unsafe` context", syntax, "use of a mutable static",
+                d => d.Note = "any code on any thread can change it; make it `readonly`, or use an atomic or a Mutex");
+        }
+
+        private bool InOwnStaticConstructor(FieldSymbol field)
+            => _b.Method.MethodKind == MethodKind.StaticConstructor && Equals(_b.Method.ContainingType.OriginalDefinition, field.ContainingType.OriginalDefinition);
+
+        private bool InUnsafeContext(SyntaxNode syntax)
+        {
+            for (var n = syntax; n != null; n = n.Parent)
+            {
+                switch (n)
+                {
+                    case Syntax.UnsafeStatementSyntax:
+                        return true;
+                    case Syntax.BaseMethodDeclarationSyntax { } m when m.Modifiers.Any(SyntaxKind.UnsafeKeyword):
+                    case Syntax.BasePropertyDeclarationSyntax { } q when q.Modifiers.Any(SyntaxKind.UnsafeKeyword):
+                    case Syntax.BaseTypeDeclarationSyntax { } t when t.Modifiers.Any(SyntaxKind.UnsafeKeyword):
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        private MirType BaseType(Place p) => p.Static is null ? _b.Locals[p.Local].Type : new MirType(p.Static.Type);
+
+        private void CheckNotThroughShared(Place p, SyntaxNode syntax, bool assign)
+        {
+            if (p.Static is { IsReadOnly: true } shared && !InOwnStaticConstructor(shared))
+            {
+                string what = _b.Describe(p);
+                if (assign) Report(ErrorCode.ERR_OwnAssignThroughShared, $"cannot assign to `{what}`, which is part of a readonly static", syntax, "readonly statics are shared by all threads");
+                else Report(ErrorCode.ERR_OwnMutBorrowThroughShared, $"cannot borrow `{what}` as mutable, because it is part of a readonly static", syntax, "readonly statics are shared by all threads");
+                return;
+            }
+
+            var t = BaseType(p);
+            foreach (var proj in p.Projs)
+            {
+                if (proj is DerefProj)
+                {
+                    if (t.Type is PointerTypeSymbol && !t.IsRef) return;
+                    if (t.Ref == RefMode.Shared)
+                    {
+                        string name = _b.Describe(p);
+                        if (assign) Report(ErrorCode.ERR_OwnAssignThroughShared, $"cannot assign to `{name}`, which is behind a shared reference", syntax, "cannot be written through a shared reference");
+                        else Report(ErrorCode.ERR_OwnMutBorrowThroughShared, $"cannot borrow `{name}` as mutable, because it is behind a shared reference", syntax, "cannot be borrowed as mutable");
+                        return;
+                    }
+                }
+                t = MirBody.Project(t, proj);
+            }
+        }
+
+        /// <summary>Inside a closure, `this` is its own environment, which the creation site has checked.</summary>
+        private bool IsClosureEnvironmentPlace(Place p)
+            => OwnershipFacts.IsClosureBody(_b.Method) && p.Static is null && p.Local == 1 && MirBody.IsClosureEnvironment(_b.Method.ContainingType)
+               && p.Projs.Length >= 2 && p.Projs[0] is DerefProj && p.Projs[1] is FieldProj;
+
+        private void CheckMoveSource(Place p, SyntaxNode syntax)
+        {
+            if (IsClosureEnvironmentPlace(p)) return;
+
+            string name = _b.Describe(p);
+            if (p.Static is not null)
+            {
+                Report(ErrorCode.ERR_OwnMoveOutOfStatic, $"cannot move out of static field `{name}`", syntax, "move occurs here");
+                return;
+            }
+
+            var t = BaseType(p);
+            if (p.Projs.IsEmpty && t.IsRef && t.Contents && _b.Locals[p.Local].Kind == LocalKind.Arg)
+            {
+                Report(ErrorCode.ERR_OwnMoveOutOfBorrow, "cannot move out of `this`, which is behind a borrow", syntax, "move occurs here",
+                    d => d.Note = "declare the method with the `move` modifier to consume `this`");
+                return;
+            }
+
+            if (p.Projs.IsEmpty && t.IsRef && t.Contents && _b.Locals[p.Local].Kind == LocalKind.User)
+            {
+                Report(ErrorCode.ERR_OwnMoveOutOfBorrow, $"cannot move out of `{name}`, which is a pattern variable", syntax, "move occurs here",
+                    d => d.Note = "pattern variables borrow from the matched value; use a cast to move it");
+                return;
+            }
+
+            foreach (var proj in p.Projs)
+            {
+                switch (proj)
+                {
+                    case DerefProj when t.IsRef:
+                    {
+                        string kind = t.Ref == RefMode.Mut ? "mutable reference" : "shared reference";
+                        Report(ErrorCode.ERR_OwnMoveOutOfBorrow, $"cannot move out of `{name}`, which is behind a {kind}", syntax, "move occurs here",
+                            d => d.Note = "use `Mem.Take` or `Mem.Replace` to take the value and leave another in its place, or borrow it with `ref`");
+                        return;
+                    }
+                    case DerefProj when t.Type is PointerTypeSymbol:
+                        Report(ErrorCode.ERR_OwnMoveOutOfBorrow, $"cannot move out of `{name}`, which is behind a raw pointer", syntax, "move occurs here",
+                            d => d.Note = "use `Mem.Read`");
+                        return;
+                    case IndexProj:
+                        Report(ErrorCode.ERR_OwnMoveOutOfIndex, $"cannot move out of array element `{name}`", syntax, "move occurs here",
+                            d => d.Note = "use `Mem.Take(ref a[i])`, or iterate with `ref`");
+                        return;
+                    case FieldProj when OwnershipFacts.FindDestructor(t.Type) is not null:
+                        Report(ErrorCode.ERR_OwnMoveOutOfDropType, $"cannot move out of `{name}`, because its type `{t.Type.ToDisplayString()}` has a destructor", syntax, "move occurs here");
+                        return;
+                }
+                t = MirBody.Project(t, proj);
+            }
+        }
+
+        // ---- stage 2
+
+        private sealed class MoveData
+        {
+            public readonly Dictionary<string, int> Paths = new Dictionary<string, int>();
+            public readonly List<List<int>> Children = new List<List<int>>();
+            public readonly List<List<(int Point, SyntaxNode Syntax)>> Sites = new List<List<(int, SyntaxNode)>>();
+
+            public int Intern(string key, int parent)
+            {
+                if (Paths.TryGetValue(key, out int id)) return id;
+                id = Paths.Count;
+                Paths[key] = id;
+                Children.Add(new List<int>());
+                Sites.Add(new List<(int, SyntaxNode)>());
+                if (parent >= 0) Children[parent].Add(id);
+                return id;
+            }
+        }
+
+        /// <summary>Path keys from the root to the place, stopping where moves can no longer reach.</summary>
+        private List<string> PathKeys(Place p, out bool complete)
+        {
+            var keys = new List<string>();
+            complete = false;
+            if (p.Static is not null) return keys;
+            string key = "_" + p.Local;
+            keys.Add(key);
+            var t = BaseType(p);
+            bool environment = IsClosureEnvironmentPlace(p);
+            foreach (var proj in p.Projs)
+            {
+                if (proj is IndexProj) return keys;
+                if (proj is DerefProj)
+                {
+                    if ((t.IsRef && !(environment && key == "_1")) || (!t.IsRef && t.Type is PointerTypeSymbol)) return keys;
+                    key += ".*";
+                }
+                else if (proj is FieldProj f)
+                {
+                    key += "." + f.Field.Name;
+                }
+                keys.Add(key);
+                t = MirBody.Project(t, proj);
+            }
+            complete = true;
+            return keys;
+        }
+
+        private void MoveAnalysis()
+        {
+            var data = new MoveData();
+
+            void Register(Place p, int point, SyntaxNode syntax)
+            {
+                // The exception slot is refilled by the unwinder, which MIR does not show.
+                if (p.Local == _b.ExceptionSlot) return;
+                var keys = PathKeys(p, out bool complete);
+                if (!complete) return;
+                int parent = -1;
+                foreach (var k in keys) parent = data.Intern(k, parent);
+                data.Sites[parent].Add((point, syntax));
+            }
+
+            foreach (var b in _blocks)
+            {
+                int point = _start[b];
+                foreach (var s in b.Statements)
+                {
+                    if (s is AssignStmt a)
+                        foreach (var op in Operands(a.Value))
+                            if (op is MoveOp m) Register(m.Place, point, s.Syntax);
+                    point++;
+                }
+                foreach (var op in TermOperands(b.Term))
+                    if (op is MoveOp m) Register(m.Place, point, b.Term.Syntax);
+            }
+
+            int n = data.Paths.Count;
+            if (n == 0) return;
+
+            void SetTree(Bits state, int path, bool value)
+            {
+                state[path] = value;
+                foreach (var c in data.Children[path]) SetTree(state, c, value);
+            }
+
+            int? Lookup(Place p)
+            {
+                var keys = PathKeys(p, out bool complete);
+                return complete && keys.Count > 0 && data.Paths.TryGetValue(keys[^1], out int id) ? id : null;
+            }
+
+            void ApplyMove(Bits state, Operand op)
+            {
+                if (op is MoveOp m && Lookup(m.Place) is int id) SetTree(state, id, true);
+            }
+
+            void ApplyInit(Bits state, Place dest)
+            {
+                if (Lookup(dest) is int id) SetTree(state, id, false);
+            }
+
+            void Transfer(Bits state, Statement s)
+            {
+                switch (s)
+                {
+                    case AssignStmt a:
+                        foreach (var op in Operands(a.Value)) ApplyMove(state, op);
+                        ApplyInit(state, a.Dest);
+                        break;
+                    case StorageDeadStmt d:
+                        if (data.Paths.TryGetValue("_" + d.Local, out int id)) SetTree(state, id, false);
+                        break;
+                }
+            }
+
+            void TransferTerm(Bits state, Terminator t)
+            {
+                foreach (var op in TermOperands(t)) ApplyMove(state, op);
+                if (t is CallTerm { Dest: { } dest }) ApplyInit(state, dest);
+            }
+
+            var entry = _blocks.ToDictionary(b => b, _ => new Bits(n));
+            var work = new Queue<BasicBlock>(_blocks);
+            var queued = new HashSet<BasicBlock>(_blocks);
+            while (work.Count > 0)
+            {
+                var b = work.Dequeue();
+                queued.Remove(b);
+                var state = entry[b].Clone();
+                foreach (var s in b.Statements) Transfer(state, s);
+                TransferTerm(state, b.Term);
+                foreach (var succ in b.Term.Successors)
+                    if (entry[succ].UnionWith(state) && queued.Add(succ)) work.Enqueue(succ);
+            }
+
+            bool HasMovedChild(Bits state, int path)
+                => data.Children[path].Any(c => state[c] || HasMovedChild(state, c));
+
+            int FirstMovedChild(Bits state, int path)
+            {
+                foreach (var c in data.Children[path])
+                {
+                    if (state[c]) return c;
+                    int r = FirstMovedChild(state, c);
+                    if (r >= 0) return r;
+                }
+                return -1;
+            }
+
+            void CheckUse(Bits state, Place place, bool borrow, bool assignDest, int point, SyntaxNode syntax)
+            {
+                var keys = PathKeys(place, out bool complete);
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    if (!data.Paths.TryGetValue(keys[i], out int id)) continue;
+                    bool isLast = complete && i == keys.Count - 1;
+                    if (assignDest && isLast) return;
+                    if (state[id])
+                    {
+                        ReportMoved(place, id, data, borrow, point, syntax, partial: false);
+                        return;
+                    }
+                    if (isLast && !assignDest && FirstMovedChild(state, id) is var child and >= 0)
+                    {
+                        ReportMoved(place, child, data, borrow, point, syntax, partial: true);
+                        return;
+                    }
+                }
+            }
+
+            foreach (var b in _blocks)
+            {
+                var state = entry[b].Clone();
+                int point = _start[b];
+                foreach (var s in b.Statements)
+                {
+                    if (s is AssignStmt a)
+                    {
+                        foreach (var (place, access, shallow) in Reads(a.Value))
+                        {
+                            CheckUse(state, place, access is Access.BorrowMut or Access.BorrowShared, false, point, a.Syntax);
+                            foreach (var ip in IndexPlaces(place)) CheckUse(state, ip, false, false, point, a.Syntax);
+                        }
+                        if (!a.Dest.IsLocal) CheckUse(state, a.Dest, false, true, point, a.Syntax);
+                    }
+                    Transfer(state, s);
+                    point++;
+                }
+                foreach (var op in TermOperands(b.Term))
+                {
+                    if (op is CopyOp c) CheckUse(state, c.Place, false, false, point, b.Term.Syntax);
+                    else if (op is MoveOp m) CheckUse(state, m.Place, false, false, point, b.Term.Syntax);
+                }
+            }
+        }
+
+        private void ReportMoved(Place place, int movedPath, MoveData data, bool borrow, int point, SyntaxNode syntax, bool partial)
+        {
+            string name = _b.Describe(place);
+            var site = data.Sites[movedPath].OrderBy(s => s.Point < point ? 0 : 1).ThenByDescending(s => s.Point).FirstOrDefault();
+            string prefix = partial ? "partially moved value" : "moved value";
+            var code = borrow ? ErrorCode.ERR_OwnBorrowOfMovedValue : ErrorCode.ERR_OwnUseOfMovedValue;
+            string message = (borrow ? "borrow of " : "use of ") + prefix + $": `{name}`";
+            Report(code, message, syntax, borrow ? "value borrowed here after move" : "value used here after move", d =>
+            {
+                if (site.Syntax != null)
+                {
+                    bool sameOrLater = site.Point >= point;
+                    d.Secondary.Add((site.Syntax.Location, sameOrLater ? "value moved here, in the previous iteration of the loop" : "value moved here"));
+                }
+                var type = _b.TypeOf(place);
+                if (place.Static is null && MirBody.IsClosureEnvironment(_b.Locals[place.Local].Type.Type))
+                    d.Note = "a capturing lambda owns the variables it captures, together with all other captured variables of this scope";
+                else if (!type.IsRef)
+                    d.Note = $"move occurs because the value has type `{type.Type.ToDisplayString()}`, which is not Copy";
+            });
+        }
+
+        // ---- stage 3
+
+        private readonly List<Bits> _regions = new List<Bits>();
+        private readonly List<(int Sup, int Sub, SyntaxNode Syntax)> _edges = new List<(int, int, SyntaxNode)>();
+        private readonly Dictionary<string, int> _universal = new Dictionary<string, int>();
+        private readonly List<int> _universalRegions = new List<int>();
+        private readonly List<Loan> _loans = new List<Loan>();
+        private readonly Dictionary<Statement, Loan> _loanAt = new Dictionary<Statement, Loan>();
+        private readonly HashSet<(int Sup, int Sub)> _implied = new HashSet<(int, int)>();
+        private int[] _localRegion;
+        private int[] _localInner;
+
+        private int NewRegion()
+        {
+            _regions.Add(new Bits(_points + 64));
+            return _regions.Count - 1;
+        }
+
+        private void Outlives(int sup, int sub, SyntaxNode syntax)
+        {
+            if (sup >= 0 && sub >= 0 && sup != sub) _edges.Add((sup, sub, syntax));
+        }
+
+        private int Universal(string name)
+        {
+            if (_universal.TryGetValue(name, out int r)) return r;
+            r = NewRegion();
+            _universal[name] = r;
+            _universalRegions.Add(r);
+            for (int i = 0; i < _points; i++) _regions[r][i] = true;
+            if (_universalRegions.Count <= 64) _regions[r][_points + _universalRegions.Count - 1] = true;
+            return r;
+        }
+
+        private int RegionOf(Operand op) => op switch
+        {
+            CopyOp c => RegionOf(c.Place),
+            MoveOp m => RegionOf(m.Place),
+            _ => -1
+        };
+
+        /// <summary>The region of the data a place holds: behind a reference, that is the inner region.</summary>
+        private int RegionOf(Place p)
+        {
+            if (p.Static is not null) return -1;
+
+            // Nothing in a heap object can hold a borrow: its fields live as long as the program may.
+            // Tasks are the exception, because a task is a borrow holder itself.
+            var t = BaseType(p);
+            foreach (var proj in p.Projs)
+            {
+                if (t.Contents && !OwnershipFacts.IsCoroutineType(t.Type)) return -1;
+                t = MirBody.Project(t, proj);
+            }
+
+            if (_localInner[p.Local] >= 0 && p.Projs.Length > 0 && p.Projs[0] is DerefProj) return _localInner[p.Local];
+            return _localRegion[p.Local];
+        }
+
+        private void Flow(Operand op, Place dest, SyntaxNode syntax)
+        {
+            Place src = op is CopyOp c ? c.Place : op is MoveOp m ? m.Place : null;
+            if (src is null) return;
+            Outlives(RegionOf(src), RegionOf(dest), syntax);
+            if (src.IsLocal && dest.IsLocal) Outlives(_localInner[src.Local], _localInner[dest.Local], syntax);
+        }
+
+        /// <summary>A loan is pointless behind a shared reference or a raw pointer.</summary>
+        private bool NeedsLoan(Place p)
+        {
+            if (p.Static is not null) return false;
+            if (_b.Locals[p.Local].IsStaticString) return false;
+            var t = BaseType(p);
+            foreach (var proj in p.Projs)
+            {
+                if (proj is DerefProj && (t.Ref == RefMode.Shared || (!t.IsRef && t.Type is PointerTypeSymbol))) return false;
+                t = MirBody.Project(t, proj);
+            }
+            return true;
+        }
+
+        private bool PassesRefDeref(Place p)
+        {
+            var t = BaseType(p);
+            foreach (var proj in p.Projs)
+            {
+                if (proj is DerefProj && t.IsRef) return true;
+                t = MirBody.Project(t, proj);
+            }
+            return false;
+        }
+
+        private void Nll()
+        {
+            _localRegion = new int[_b.Locals.Count];
+            _localInner = new int[_b.Locals.Count];
+            var sig = OwnershipFacts.GetLifetimeSig(_b.Method);
+            for (int i = 0; i < _localRegion.Length; i++)
+            {
+                var type = _b.Locals[i].Type;
+                _localRegion[i] = OwnershipFacts.CarriesBorrow(type) ? NewRegion() : -1;
+                _localInner[i] = type.IsRef && !type.Contents && OwnershipFacts.IsBorrowHolder(type.Type) ? NewRegion() : -1;
+            }
+
+            int returnRegion = -1;
+            for (int i = 0; i < sig.Inputs.Length && i < _b.ArgCount; i++)
+            {
+                int local = i + 1;
+                if (_localRegion[local] < 0) continue;
+                string name = sig.Inputs[i] ?? "'#anon" + i;
+                if (_localInner[local] >= 0)
+                {
+                    // `&'outer mut View<'name>`: the name is the data, and the data outlives the reference.
+                    int inner = Universal(name);
+                    int outer = Universal("'#outer" + local);
+                    _localInner[local] = inner;
+                    _localRegion[local] = outer;
+                    _implied.Add((inner, outer));
+                    Outlives(inner, outer, _b.Syntax);
+                    if (name == sig.Output && name.StartsWith("'#", StringComparison.Ordinal)) returnRegion = outer;
+                }
+                else
+                {
+                    _localRegion[local] = Universal(name);
+                }
+            }
+            // Borrow-carrying inputs the signature does not name still outlive the call.
+            for (int local = 1; local <= _b.ArgCount; local++)
+                if (_localRegion[local] >= 0 && !_universalRegions.Contains(_localRegion[local]))
+                    _localRegion[local] = Universal("'#anon" + local);
+
+            // '#data: what a ref struct or reference returns lives as long as what it points at.
+            if (sig.Output == "'#data" && _b.ArgCount > 0 && _localInner[1] >= 0) returnRegion = _localInner[1];
+            // '#data+: as long as that and the other borrowed inputs, but not the borrow of `this`.
+            if (sig.Output == "'#data+")
+            {
+                int shortest = Universal("'#data+");
+                if (_b.ArgCount > 0 && _localInner[1] >= 0) DeclareOutlives(_localInner[1], shortest);
+                for (int local = 2; local <= _b.ArgCount; local++)
+                {
+                    int u = _localInner[local] >= 0 ? _localInner[local] : _localRegion[local];
+                    if (u >= 0) DeclareOutlives(u, shortest);
+                }
+                returnRegion = shortest;
+            }
+
+            if (_localRegion[0] >= 0)
+            {
+                if (returnRegion >= 0) _localRegion[0] = returnRegion;
+                else if (sig.Output != null) _localRegion[0] = Universal(sig.Output);
+                else if (sig.OutputFromAll)
+                    foreach (var u in _universalRegions.ToList()) Outlives(u, _localRegion[0], _b.Syntax);
+            }
+
+            foreach (var (longer, shorter) in sig.Bounds) DeclareOutlives(Universal(longer), Universal(shorter));
+            CloseImplied();
+
+            BuildConstraints();
+            AddLiveness();
+            Propagate();
+            CheckUniversal();
+            CheckLoans();
+        }
+
+        private void DeclareOutlives(int longer, int shorter)
+        {
+            _implied.Add((longer, shorter));
+            Outlives(longer, shorter, _b.Syntax);
+        }
+
+        /// <summary>Declared relations are transitive: `'a : 'b` and `'b : 'c` give `'a : 'c`.</summary>
+        private void CloseImplied()
+        {
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                foreach (var (a, b) in _implied.ToList())
+                    foreach (var (c, d) in _implied.ToList())
+                        if (b == c && a != d && _implied.Add((a, d))) changed = true;
+            }
+        }
+
+        private void BuildConstraints()
+        {
+            foreach (var b in _blocks)
+            {
+                int point = _start[b];
+                foreach (var s in b.Statements)
+                {
+                    if (s is AssignStmt a)
+                    {
+                        int dest = RegionOf(a.Dest);
+                        if (a.Value is RefRv r)
+                        {
+                            int data = RegionOf(r.Place);
+                            int destInner = a.Dest.IsLocal ? _localInner[a.Dest.Local] : -1;
+                            if (OwnershipFacts.CarriesBorrow(_b.TypeOf(r.Place)))
+                            {
+                                // &mut to a borrow holder is invariant in the data's region.
+                                Outlives(data, destInner >= 0 ? destInner : dest, a.Syntax);
+                                if (destInner >= 0 && r.Mode == RefMode.Mut) Outlives(destInner, data, a.Syntax);
+                            }
+                            if (r.Place.Static is null && PassesRefDeref(r.Place)) Outlives(_localRegion[r.Place.Local], dest, a.Syntax);
+                            // Remember what a receiver borrows, for the content lifetime of containers.
+                            if (a.Dest.IsLocal && r.Place.Static is null && r.Place.Projs.All(x => x is DerefProj)) _refSource[a.Dest.Local] = r.Place.Local;
+                            if (NeedsLoan(r.Place))
+                            {
+                                var loan = new Loan { Index = _loans.Count, Point = point, Region = NewRegion(), Place = r.Place, Mode = r.Mode, Syntax = a.Syntax };
+                                _loans.Add(loan);
+                                _loanAt[s] = loan;
+                                Outlives(loan.Region, dest, a.Syntax);
+                            }
+                        }
+                        else if (dest >= 0)
+                        {
+                            foreach (var op in Operands(a.Value)) Flow(op, a.Dest, a.Syntax);
+                        }
+                        else if (a.Value is not LinkRv)
+                        {
+                            // A place without a region (a field of an object, a static) outlives any scope.
+                            foreach (var op in Operands(a.Value)) RequireStatic(op, a.Syntax);
+                        }
+                    }
+                    point++;
+                }
+
+                if (b.Term is CallTerm { Method: { } m } c) CallConstraints(c, m);
+            }
+        }
+
+        private void RequireStatic(Operand op, SyntaxNode syntax)
+        {
+            Place p = op is CopyOp c ? c.Place : op is MoveOp m ? m.Place : null;
+            if (p is null) return;
+            int region = RegionOf(p);
+            var type = _b.TypeOf(p);
+
+            // A moved `this` or pattern variable is an error of its own, reported by the move rules.
+            if (region >= 0 && OwnershipFacts.CarriesBorrow(type) && !type.Contents) Outlives(region, Universal("'static"), syntax);
+        }
+
+        private readonly Dictionary<int, int> _refSource = new Dictionary<int, int>();
+
+        /// <summary>The region of the container a receiver borrows, or -1.</summary>
+        private int ContentRegion(Operand receiver)
+        {
+            Place p = receiver is CopyOp c ? c.Place : receiver is MoveOp mo ? mo.Place : null;
+            if (p is null || !p.IsLocal) return -1;
+            int local = _refSource.TryGetValue(p.Local, out int source) ? source : p.Local;
+            var t = _b.Locals[local].Type;
+            return t.IsRef || !OwnershipFacts.CarriesBorrows(t.Type) ? -1 : _localRegion[local];
+        }
+
+        private void CallConstraints(CallTerm c, MethodSymbol m)
+        {
+            // `unsafe` escape hatch: the result of a transmute has no relation to its input.
+            if (m.Name == "Transmute" && m.ContainingType.Name == "Mem") return;
+
+            var sig = OwnershipFacts.GetLifetimeSig(m);
+            var fresh = new Dictionary<string, int>();
+            int Fresh(string name)
+            {
+                if (name == "'static") return Universal(name);
+                if (!fresh.TryGetValue(name, out int r)) fresh[name] = r = NewRegion();
+                return r;
+            }
+
+            int InnerOf(Operand op) => op is CopyOp { Place: { IsLocal: true } cp } ? _localInner[cp.Local]
+                : op is MoveOp { Place: { IsLocal: true } mp } ? _localInner[mp.Local] : -1;
+
+            int content = !m.IsStatic && c.Args.Count > 0 ? ContentRegion(c.Args[0]) : -1;
+
+            for (int i = 0; i < c.Args.Count && i < sig.Inputs.Length; i++)
+            {
+                var name = sig.Inputs[i];
+                int arg = RegionOf(c.Args[i]);
+                if (name == "'#self")
+                {
+                    // Stored into a container: what it borrows must outlive the container, like Vec::push.
+                    if (content >= 0) Outlives(arg, content, c.Syntax);
+                    else RequireStatic(c.Args[i], c.Syntax);
+                    continue;
+                }
+                if (name is null)
+                {
+                    // Handed to a parameter that cannot express a borrow, such as `T` in `List<T>.Add`.
+                    RequireStatic(c.Args[i], c.Syntax);
+                    continue;
+                }
+                if (arg < 0) continue;
+                int f = Fresh(name);
+                int inner = InnerOf(c.Args[i]);
+                if (inner >= 0)
+                {
+                    // The signature names the data behind `ref View`; the callee may store into it.
+                    Outlives(inner, f, c.Syntax);
+                    if (c.Args[i] is MoveOp) Outlives(f, inner, c.Syntax);
+                }
+                else
+                {
+                    Outlives(arg, f, c.Syntax);
+                }
+            }
+
+            foreach (var (longer, shorter) in sig.Bounds) Outlives(Fresh(longer), Fresh(shorter), c.Syntax);
+
+            if (c.Dest is null) return;
+            int dest = RegionOf(c.Dest);
+            int destInner = c.Dest.IsLocal ? _localInner[c.Dest.Local] : -1;
+
+            // What comes out of a container (an element, an enumerator, a reference to an element)
+            // is usable only while its content lives.
+            if (content >= 0)
+            {
+                Outlives(content, dest, c.Syntax);
+                Outlives(content, destInner, c.Syntax);
+                if (sig.Output == "'#self") return;
+            }
+
+            if (sig.Output == "'#data+")
+            {
+                int data = c.Args.Count > 0 ? InnerOf(c.Args[0]) : -1;
+                if (data < 0 && c.Args.Count > 0) data = RegionOf(c.Args[0]);
+                Outlives(data, dest, c.Syntax);
+                Outlives(data, destInner, c.Syntax);
+                for (int i = 1; i < c.Args.Count && i < sig.Inputs.Length; i++)
+                {
+                    if (sig.Inputs[i] is null) continue;
+                    Outlives(RegionOf(c.Args[i]), dest, c.Syntax);
+                    Outlives(InnerOf(c.Args[i]), dest, c.Syntax);
+                }
+                return;
+            }
+
+            if (sig.Output == "'#data")
+            {
+                int data = c.Args.Count > 0 ? InnerOf(c.Args[0]) : -1;
+                if (data < 0 && c.Args.Count > 0) data = RegionOf(c.Args[0]);
+                Outlives(data, dest, c.Syntax);
+                Outlives(data, destInner, c.Syntax);
+                return;
+            }
+
+            // A returned reference points at data that lives no longer than the data behind the input.
+            if (destInner >= 0 && sig.Output != null)
+                for (int i = 0; i < c.Args.Count && i < sig.Inputs.Length; i++)
+                    if (sig.Inputs[i] == sig.Output) Outlives(InnerOf(c.Args[i]), destInner, c.Syntax);
+
+            if (dest < 0) return;
+            if (sig.Output != null)
+            {
+                if (sig.Inputs.Contains(sig.Output)) Outlives(Fresh(sig.Output), dest, c.Syntax);
+                // An elided result borrows through the reference as well as from the data behind it.
+                for (int i = 0; i < c.Args.Count && i < sig.Inputs.Length; i++)
+                    if (sig.Inputs[i] == sig.Output && InnerOf(c.Args[i]) >= 0) Outlives(RegionOf(c.Args[i]), dest, c.Syntax);
+            }
+            else
+            {
+                foreach (var a in c.Args)
+                {
+                    Outlives(RegionOf(a), dest, c.Syntax);
+                    Outlives(InnerOf(a), dest, c.Syntax);
+                }
+            }
+        }
+
+        private IEnumerable<int> UsedLocals(Statement s)
+        {
+            switch (s)
+            {
+                case AssignStmt a:
+                    foreach (var (place, _, _) in Reads(a.Value))
+                    {
+                        if (place.Static is null) yield return place.Local;
+                        foreach (var ip in IndexPlaces(place)) if (ip.Static is null) yield return ip.Local;
+                    }
+                    if (!a.Dest.IsLocal && a.Dest.Static is null) yield return a.Dest.Local;
+                    break;
+                case DropStmt d:
+                    if (d.Place.Static is null && OwnershipFacts.DropUsesBorrows(_b.TypeOf(d.Place).Type)) yield return d.Place.Local;
+                    break;
+            }
+        }
+
+        private static IEnumerable<int> UsedLocals(Terminator t)
+        {
+            foreach (var op in TermOperands(t))
+            {
+                if (op is CopyOp c && c.Place.Static is null) yield return c.Place.Local;
+                else if (op is MoveOp m && m.Place.Static is null) yield return m.Place.Local;
+            }
+            if (t is ReturnTerm) yield return 0;
+            if (t is CallTerm { Dest: { IsLocal: false, Static: null } d }) yield return d.Local;
+        }
+
+        private static int DefinedLocal(Statement s) => s switch
+        {
+            AssignStmt { Dest: { IsLocal: true } d } => d.Local,
+            StorageDeadStmt d => d.Local,
+            _ => -1
+        };
+
+        private void AddLiveness()
+        {
+            int n = _b.Locals.Count;
+            var liveIn = _blocks.ToDictionary(b => b, _ => new Bits(n));
+            bool changed = true;
+
+            void Step(Bits live, Statement s)
+            {
+                int def = DefinedLocal(s);
+                if (def >= 0) live[def] = false;
+                foreach (var u in UsedLocals(s)) live[u] = true;
+            }
+
+            void StepTerm(Bits live, Terminator t)
+            {
+                if (t is CallTerm { Dest: { IsLocal: true } d }) live[d.Local] = false;
+                foreach (var u in UsedLocals(t)) live[u] = true;
+            }
+
+            while (changed)
+            {
+                changed = false;
+                for (int i = _blocks.Count - 1; i >= 0; i--)
+                {
+                    var b = _blocks[i];
+                    var live = new Bits(n);
+                    foreach (var s in b.Term.Successors) live.UnionWith(liveIn[s]);
+                    StepTerm(live, b.Term);
+                    for (int k = b.Statements.Count - 1; k >= 0; k--) Step(live, b.Statements[k]);
+                    if (liveIn[b].UnionWith(live)) changed = true;
+                }
+            }
+
+            // Rust's #[must_not_suspend]: a lock held across an `await` blocks every task that needs it
+            // for as long as this one sleeps.
+            Dictionary<BasicBlock, Bits> holding = null;
+            foreach (var b in _blocks)
+            {
+                if (b.Term is not SuspendTerm { IsYield: false, Resume: var resume } suspend) continue;
+                foreach (int l in liveIn[resume].Ones())
+                {
+                    var type = _b.Locals[l].Type.Type;
+                    if (!OwnershipFacts.HasAttribute(type, "MustNotSuspendAttribute")) continue;
+
+                    // Cleanup paths keep a local "live" before it has a value; it must actually hold one.
+                    holding ??= MaybeHolding();
+                    if (holding[b][l])
+                        Report(ErrorCode.ERR_OwnMustNotSuspend, $"`{type.ToDisplayString()}` must not be held across an `await`", _b.Locals[l].Syntax, "this value lives across a suspension",
+                            d =>
+                            {
+                                d.Secondary.Add((suspend.Syntax.Location, "the task suspends here"));
+                                d.Note = "end its scope before the await, or drop it with Mem.Drop";
+                            });
+                }
+            }
+
+            foreach (var b in _blocks)
+            {
+                var live = new Bits(n);
+                foreach (var s in b.Term.Successors) live.UnionWith(liveIn[s]);
+                int point = _start[b] + b.Statements.Count;
+                // Liveness holds *on entry* to the following point: a point belongs to a region when
+                // the local is live just before it runs.
+                StepTerm(live, b.Term);
+                MarkLive(live, point);
+                for (int k = b.Statements.Count - 1; k >= 0; k--)
+                {
+                    Step(live, b.Statements[k]);
+                    MarkLive(live, --point);
+                }
+            }
+        }
+
+        /// <summary>For each block end, the locals that may hold a value there.</summary>
+        private Dictionary<BasicBlock, Bits> MaybeHolding()
+        {
+            int n = _b.Locals.Count;
+            var atEnd = _blocks.ToDictionary(b => b, _ => new Bits(n));
+            var entry = _blocks.ToDictionary(b => b, _ => new Bits(n));
+            var work = new Queue<BasicBlock>(_blocks);
+            var queued = new HashSet<BasicBlock>(_blocks);
+            while (work.Count > 0)
+            {
+                var b = work.Dequeue();
+                queued.Remove(b);
+                var state = entry[b].Clone();
+                foreach (var s in b.Statements)
+                {
+                    if (s is AssignStmt a)
+                    {
+                        foreach (var op in Operands(a.Value))
+                            if (op is MoveOp { Place: { IsLocal: true } m }) state[m.Local] = false;
+                        if (a.Dest.IsLocal) state[a.Dest.Local] = true;
+                    }
+                    else if (s is StorageDeadStmt dead)
+                    {
+                        state[dead.Local] = false;
+                    }
+                }
+                foreach (var op in TermOperands(b.Term))
+                    if (op is MoveOp { Place: { IsLocal: true } m }) state[m.Local] = false;
+                atEnd[b] = state.Clone();
+                if (b.Term is CallTerm { Dest: { IsLocal: true } d }) state[d.Local] = true;
+                foreach (var succ in b.Term.Successors)
+                    if (entry[succ].UnionWith(state) && queued.Add(succ)) work.Enqueue(succ);
+            }
+            return atEnd;
+        }
+
+        private void MarkLive(Bits live, int point)
+        {
+            foreach (int l in live.Ones())
+            {
+                if (_localRegion[l] >= 0) _regions[_localRegion[l]][point] = true;
+                if (_localInner[l] >= 0) _regions[_localInner[l]][point] = true;
+            }
+        }
+
+        private void Propagate()
+        {
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                foreach (var (sup, sub, _) in _edges)
+                    if (_regions[sup].UnionWith(_regions[sub])) changed = true;
+            }
+        }
+
+        private void CheckUniversal()
+        {
+            foreach (var (name, region) in _universal)
+            {
+                foreach (var (otherName, other) in _universal)
+                {
+                    if (region == other || _implied.Contains((region, other))) continue;
+                    int bit = _universalRegions.IndexOf(other);
+                    if (bit >= 64 || !_regions[region][_points + bit]) continue;
+                    var syntax = Blame(region, other) ?? _b.Syntax;
+                    string a = Pretty(name), c = Pretty(otherName);
+                    Report(ErrorCode.ERR_OwnLifetimeMismatch, $"lifetime may not live long enough: {a} must outlive {c}", syntax,
+                        "data flows between these lifetimes here",
+                        d => d.Note = "give both references the same named lifetime, for example `ref 'a int`");
+                }
+            }
+        }
+
+        private string Pretty(string lifetime)
+        {
+            if (!lifetime.StartsWith("'#", StringComparison.Ordinal)) return "`" + lifetime + "`";
+            var rest = lifetime.Substring(2);
+            if (rest == "this") return "the lifetime of `this`";
+            if (int.TryParse(rest, out int i) && i < _b.Method.ParameterCount)
+                return $"the lifetime of `{_b.Method.Parameters[i].Name}`";
+            return "an anonymous lifetime";
+        }
+
+        private SyntaxNode Blame(int sup, int sub)
+        {
+            var seen = new HashSet<int> { sub };
+            var work = new Queue<int>();
+            work.Enqueue(sub);
+            while (work.Count > 0)
+            {
+                int r = work.Dequeue();
+                foreach (var (s, t, syntax) in _edges)
+                {
+                    if (t != r || !seen.Add(s)) continue;
+                    if (s == sup) return syntax;
+                    work.Enqueue(s);
+                }
+            }
+            return null;
+        }
+
+        private void CheckLoans()
+        {
+            if (_loans.Count == 0) return;
+            int n = _loans.Count;
+            var entry = _blocks.ToDictionary(b => b, _ => new Bits(n));
+
+            void Prune(Bits state, int point)
+            {
+                foreach (int l in state.Ones().ToList())
+                    if (!_regions[_loans[l].Region][point]) state[l] = false;
+            }
+
+            void KillDerefLoans(Bits state, int local)
+            {
+                foreach (int l in state.Ones().ToList())
+                {
+                    var p = _loans[l].Place;
+                    if (p.Static is null && p.Local == local && p.Projs.Length > 0 && p.Projs[0] is DerefProj && _b.Locals[local].Type.IsRef)
+                        state[l] = false;
+                }
+            }
+
+            void Apply(Bits state, Statement s)
+            {
+                if (_loanAt.TryGetValue(s, out var loan)) state[loan.Index] = true;
+                if (s is AssignStmt { Dest: { IsLocal: true } d }) KillDerefLoans(state, d.Local);
+                if (s is StorageDeadStmt dead) KillDerefLoans(state, dead.Local);
+            }
+
+            var work = new Queue<BasicBlock>(_blocks);
+            var queued = new HashSet<BasicBlock>(_blocks);
+            while (work.Count > 0)
+            {
+                var b = work.Dequeue();
+                queued.Remove(b);
+                var state = entry[b].Clone();
+                int point = _start[b];
+                foreach (var s in b.Statements)
+                {
+                    Prune(state, point);
+                    Apply(state, s);
+                    point++;
+                }
+                Prune(state, point);
+                foreach (var succ in b.Term.Successors)
+                    if (entry[succ].UnionWith(state) && queued.Add(succ)) work.Enqueue(succ);
+            }
+
+            foreach (var b in _blocks)
+            {
+                var state = entry[b].Clone();
+                int point = _start[b];
+                foreach (var s in b.Statements)
+                {
+                    Prune(state, point);
+                    CheckStatement(state, s, point);
+                    Apply(state, s);
+                    point++;
+                }
+                Prune(state, point);
+                foreach (var op in TermOperands(b.Term))
+                {
+                    if (op is CopyOp c) CheckAccess(state, c.Place, Access.Copy, false, point, b.Term.Syntax);
+                    else if (op is MoveOp m) CheckAccess(state, m.Place, Access.Move, false, point, b.Term.Syntax);
+                }
+                if (b.Term is CallTerm { Dest: { } dest }) CheckAccess(state, dest, Access.Assign, true, point, b.Term.Syntax);
+            }
+        }
+
+        private void CheckStatement(Bits state, Statement s, int point)
+        {
+            switch (s)
+            {
+                case AssignStmt a:
+                    foreach (var (place, access, shallow) in Reads(a.Value))
+                        CheckAccess(state, place, access, shallow, point, a.Syntax);
+                    CheckAccess(state, a.Dest, Access.Assign, true, point, a.Syntax);
+                    break;
+                case DropStmt { ForAssign: false } d:
+                    CheckAccess(state, d.Place, Access.Drop, false, point, d.Syntax);
+                    break;
+                case StorageDeadStmt d:
+                    CheckAccess(state, new Place(d.Local), Access.StorageDead, true, point, d.Syntax);
+                    break;
+            }
+        }
+
+        private bool Conflicts(Loan loan, Place access, bool shallow)
+        {
+            var lp = loan.Place;
+            if (access.Static is not null || lp.Local != access.Local) return false;
+
+            var t = BaseType(lp);
+            int common = Math.Min(lp.Projs.Length, access.Projs.Length);
+            for (int i = 0; i < common; i++)
+            {
+                var a = lp.Projs[i];
+                var c = access.Projs[i];
+                if (a is FieldProj fa && c is FieldProj fc && !Equals(fa.Field.OriginalDefinition, fc.Field.OriginalDefinition))
+                    return false;
+                if (a.GetType() != c.GetType()) return true;
+                t = MirBody.Project(t, a);
+            }
+
+            // The access reaches a prefix of the loan: what lies behind a reference is unaffected by
+            // writing the reference itself, and shared data stays valid even if its reference goes away.
+            for (int i = common; i < lp.Projs.Length; i++)
+            {
+                var proj = lp.Projs[i];
+                if (proj is DerefProj)
+                {
+                    if (t.Ref == RefMode.Shared) return false;
+                    if (t.IsRef && shallow) return false;
+                    if (!t.IsRef && t.Type is PointerTypeSymbol) return false;
+                }
+                t = MirBody.Project(t, proj);
+            }
+            return true;
+        }
+
+        private void CheckAccess(Bits state, Place place, Access access, bool shallow, int point, SyntaxNode syntax)
+        {
+            bool isRead = access is Access.Copy or Access.BorrowShared;
+            foreach (int l in state.Ones())
+            {
+                var loan = _loans[l];
+                if (isRead && loan.Mode == RefMode.Shared) continue;
+                if (!Conflicts(loan, place, shallow)) continue;
+                ReportConflict(loan, place, access, point, syntax);
+            }
+        }
+
+        private void ReportConflict(Loan loan, Place place, Access access, int point, SyntaxNode syntax)
+        {
+            string name = _b.Describe(place);
+            string borrowed = _b.Describe(loan.Place);
+            void Common(OwnershipDiagnostic d, string first)
+            {
+                d.Secondary.Add((loan.Syntax.Location, first));
+                if (LaterUse(loan, point) is { } use) d.Secondary.Add((use.Location, "borrow later used here"));
+            }
+
+            string kindLabel = loan.Mode == RefMode.Mut ? "mutable borrow occurs here" : "immutable borrow occurs here";
+            switch (access)
+            {
+                case Access.Copy:
+                    Report(ErrorCode.ERR_OwnUseWhileMutBorrowed, $"cannot use `{name}` because it is mutably borrowed", syntax, "use of borrowed value", d => Common(d, $"`{borrowed}` is borrowed here"));
+                    break;
+                case Access.Move:
+                    Report(ErrorCode.ERR_OwnMoveWhileBorrowed, $"cannot move out of `{name}` because it is borrowed", syntax, "move out of borrowed value", d => Common(d, $"`{borrowed}` is borrowed here"));
+                    break;
+                case Access.Assign:
+                    Report(ErrorCode.ERR_OwnAssignToBorrowed, $"cannot assign to `{name}` because it is borrowed", syntax, "assignment to borrowed value", d => Common(d, $"`{borrowed}` is borrowed here"));
+                    break;
+                case Access.BorrowShared:
+                    Report(ErrorCode.ERR_OwnSharedBorrowWhileMut, $"cannot borrow `{name}` as immutable because it is also borrowed as mutable", syntax, "immutable borrow occurs here", d => Common(d, kindLabel));
+                    break;
+                case Access.BorrowMut when loan.Mode == RefMode.Shared:
+                    Report(ErrorCode.ERR_OwnMutBorrowWhileShared, $"cannot borrow `{name}` as mutable because it is also borrowed as immutable", syntax, "mutable borrow occurs here", d => Common(d, kindLabel));
+                    break;
+                case Access.BorrowMut:
+                    Report(ErrorCode.ERR_OwnDoubleMutBorrow, $"cannot borrow `{name}` as mutable more than once at a time", syntax, "second mutable borrow occurs here", d => Common(d, "first mutable borrow occurs here"));
+                    break;
+                default:
+                {
+                    var local = place.Static is null ? _b.Locals[place.Local] : null;
+                    if (local != null && MirBody.IsClosureEnvironment(local.Type.Type))
+                    {
+                        Report(ErrorCode.ERR_OwnClosureOutlives, $"closure may outlive the current function, but it borrows `{borrowed}`", loan.Syntax, "this closure borrows its environment",
+                            d => d.Note = "use a `move` lambda to give the closure ownership of what it captures");
+                        break;
+                    }
+
+                    bool escapes = _universalRegions.Any(u => _regions[loan.Region][_points + Math.Min(_universalRegions.IndexOf(u), 63)]);
+                    if (escapes)
+                    {
+                        Report(ErrorCode.ERR_OwnReturnRefToLocal, $"cannot return a reference to local `{name}`", loan.Syntax, "this borrow outlives the function", d => d.Note = $"`{name}` is dropped when the function returns");
+                    }
+                    else if (local?.Kind == LocalKind.Temp)
+                    {
+                        Report(ErrorCode.ERR_OwnTemporaryDropped, "temporary value dropped while borrowed", loan.Syntax, "this temporary is freed at the end of the statement", d =>
+                        {
+                            if (LaterUse(loan, point) is { } use) d.Secondary.Add((use.Location, "borrow later used here"));
+                        });
+                    }
+                    else
+                    {
+                        Report(ErrorCode.ERR_OwnDoesNotLiveLongEnough, $"`{name}` does not live long enough", loan.Syntax, "borrowed value does not live long enough", d =>
+                        {
+                            d.Secondary.Add((syntax.Location, $"`{name}` is dropped here while still borrowed"));
+                            if (LaterUse(loan, point) is { } use) d.Secondary.Add((use.Location, "borrow later used here"));
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+
+        /// <summary>Finds a use of a local fed by the loan, walking forward inside the loan's region.</summary>
+        private SyntaxNode LaterUse(Loan loan, int fromPoint)
+        {
+            var carriers = new HashSet<int> { loan.Region };
+            var work = new Queue<int>();
+            work.Enqueue(loan.Region);
+            while (work.Count > 0)
+            {
+                int r = work.Dequeue();
+                foreach (var (sup, sub, _) in _edges)
+                    if (sup == r && carriers.Add(sub)) work.Enqueue(sub);
+            }
+
+            bool Carries(int local) => local >= 0 && _localRegion[local] >= 0 && carriers.Contains(_localRegion[local]) && _b.Locals[local].Kind != LocalKind.Temp;
+
+            var seen = new HashSet<BasicBlock>();
+            var queue = new Queue<(BasicBlock Block, int Index)>();
+            foreach (var b in _blocks)
+            {
+                int start = _start[b];
+                if (fromPoint >= start && fromPoint <= start + b.Statements.Count)
+                {
+                    queue.Enqueue((b, fromPoint - start + 1));
+                    break;
+                }
+            }
+
+            while (queue.Count > 0)
+            {
+                var (b, index) = queue.Dequeue();
+                for (int i = index; i < b.Statements.Count; i++)
+                {
+                    var s = b.Statements[i];
+                    if (s is not (AssignStmt or DropStmt)) continue;
+                    if (UsedLocals(s).Any(Carries)) return s.Syntax;
+                }
+                if (index <= b.Statements.Count && UsedLocals(b.Term).Any(Carries)) return b.Term.Syntax;
+                foreach (var succ in b.Term.Successors)
+                    if (seen.Add(succ)) queue.Enqueue((succ, 0));
+            }
+
+            // Temporaries carry the use when no named local does, as in `F(ref a, ref a)`.
+            foreach (var b in _blocks)
+                if (b.Term is CallTerm c && c.Args.Any(a => RegionOf(a) is var r and >= 0 && carriers.Contains(r)) && _start[b] + b.Statements.Count >= fromPoint)
+                    return c.Syntax;
+            return null;
+        }
+    }
+}

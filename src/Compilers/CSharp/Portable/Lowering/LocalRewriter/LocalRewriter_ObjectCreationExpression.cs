@@ -94,7 +94,8 @@ namespace Microsoft.CodeAnalysis.CSharp
             rewrittenObjectCreation = node.Update(constructor, rewrittenArguments, argumentRefKindsOpt, newInitializerExpression: null, changeTypeOpt: constructor.ContainingType);
 
             // replace "new S()" with a default struct ctor with "default(S)"
-            if (constructor.IsDefaultValueTypeConstructor())
+            // RustSharp: a struct with a destructor distinguishes `new S()` from `default(S)`.
+            if (constructor.IsDefaultValueTypeConstructor() && !(_factory.CompilationState.ModuleBuilderOpt?.BodySink is not null && Ownership.OwnershipFacts.FindDestructor(constructor.ContainingType) is not null))
             {
                 rewrittenObjectCreation = new BoundDefaultExpression(rewrittenObjectCreation.Syntax, rewrittenObjectCreation.Type!);
             }

@@ -612,6 +612,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
             {
                 switch (modifier.Kind())
                 {
+                    case SyntaxKind.LifetimeToken:
+                        continue; // RustSharp: consumed by the ownership analysis.
+
                     case SyntaxKind.ThisKeyword:
                         Binder.CheckFeatureAvailability(modifier, MessageID.IDS_FeatureExtensionMethod, diagnostics);
 
@@ -1134,6 +1137,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
             {
                 switch (modifier.Kind())
                 {
+                    case SyntaxKind.LifetimeToken:
+                        break; // RustSharp: consumed by the ownership analysis.
                     case SyntaxKind.OutKeyword:
                         if (refKind == RefKind.None)
                         {

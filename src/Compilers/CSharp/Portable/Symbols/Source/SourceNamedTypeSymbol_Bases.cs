@@ -440,6 +440,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
             BaseListSyntax bases = GetBaseListOpt(decl);
             if (bases == null)
             {
+                // RustSharp: a variant of an enum with data derives from the enum.
+                if (this.ContainingType is { } union && UnionSyntax.IsVariant(decl.SyntaxReference.GetSyntax()))
+                    return Tuple.Create(union, ImmutableArray<NamedTypeSymbol>.Empty);
                 return null;
             }
 

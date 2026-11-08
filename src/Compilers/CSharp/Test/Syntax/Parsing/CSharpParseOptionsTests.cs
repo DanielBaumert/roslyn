@@ -77,6 +77,7 @@ namespace Microsoft.CodeAnalysis.CSharp.UnitTests.Parsing
                 typeof(CSharpParseOptions),
                 "Features",
                 "FileBasedProgram",
+                "IsOwnershipEnabled", // RustSharp: derived from Features, which is already compared
                 "Language",
                 "LanguageVersion",
                 "InterceptorsNamespaces",

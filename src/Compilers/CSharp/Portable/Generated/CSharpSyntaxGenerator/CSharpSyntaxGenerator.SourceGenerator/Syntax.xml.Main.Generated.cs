@@ -1558,7 +1558,7 @@ public partial class CSharpSyntaxRewriter : CSharpSyntaxVisitor<SyntaxNode?>
         => node.Update(VisitToken(node.OmittedTypeArgumentToken));
 
     public override SyntaxNode? VisitRefType(RefTypeSyntax node)
-        => node.Update(VisitToken(node.RefKeyword), VisitToken(node.ReadOnlyKeyword), (TypeSyntax?)Visit(node.Type) ?? throw new ArgumentNullException("type"));
+        => node.Update(VisitToken(node.RefKeyword), VisitToken(node.ReadOnlyKeyword), VisitToken(node.LifetimeToken), (TypeSyntax?)Visit(node.Type) ?? throw new ArgumentNullException("type"));
 
     public override SyntaxNode? VisitScopedType(ScopedTypeSyntax node)
         => node.Update(VisitToken(node.ScopedKeyword), (TypeSyntax?)Visit(node.Type) ?? throw new ArgumentNullException("type"));
@@ -2496,7 +2496,7 @@ public static partial class SyntaxFactory
         => SyntaxFactory.OmittedTypeArgument(SyntaxFactory.Token(SyntaxKind.OmittedTypeArgumentToken));
 
     /// <summary>Creates a new RefTypeSyntax instance.</summary>
-    public static RefTypeSyntax RefType(SyntaxToken refKeyword, SyntaxToken readOnlyKeyword, TypeSyntax type)
+    public static RefTypeSyntax RefType(SyntaxToken refKeyword, SyntaxToken readOnlyKeyword, SyntaxToken lifetimeToken, TypeSyntax type)
     {
         if (refKeyword.Kind() != SyntaxKind.RefKeyword) throw new ArgumentException(nameof(refKeyword));
         switch (readOnlyKeyword.Kind())
@@ -2505,13 +2505,19 @@ public static partial class SyntaxFactory
             case SyntaxKind.None: break;
             default: throw new ArgumentException(nameof(readOnlyKeyword));
         }
+        switch (lifetimeToken.Kind())
+        {
+            case SyntaxKind.LifetimeToken:
+            case SyntaxKind.None: break;
+            default: throw new ArgumentException(nameof(lifetimeToken));
+        }
         if (type == null) throw new ArgumentNullException(nameof(type));
-        return (RefTypeSyntax)Syntax.InternalSyntax.SyntaxFactory.RefType((Syntax.InternalSyntax.SyntaxToken)refKeyword.Node!, (Syntax.InternalSyntax.SyntaxToken?)readOnlyKeyword.Node, (Syntax.InternalSyntax.TypeSyntax)type.Green).CreateRed();
+        return (RefTypeSyntax)Syntax.InternalSyntax.SyntaxFactory.RefType((Syntax.InternalSyntax.SyntaxToken)refKeyword.Node!, (Syntax.InternalSyntax.SyntaxToken?)readOnlyKeyword.Node, (Syntax.InternalSyntax.SyntaxToken?)lifetimeToken.Node, (Syntax.InternalSyntax.TypeSyntax)type.Green).CreateRed();
     }
 
     /// <summary>Creates a new RefTypeSyntax instance.</summary>
     public static RefTypeSyntax RefType(TypeSyntax type)
-        => SyntaxFactory.RefType(SyntaxFactory.Token(SyntaxKind.RefKeyword), default, type);
+        => SyntaxFactory.RefType(SyntaxFactory.Token(SyntaxKind.RefKeyword), default, default, type);
 
     /// <summary>Creates a new ScopedTypeSyntax instance.</summary>
     public static ScopedTypeSyntax ScopedType(SyntaxToken scopedKeyword, TypeSyntax type)
@@ -2621,7 +2627,8 @@ public static partial class SyntaxFactory
         {
             case SyntaxKind.PostIncrementExpression:
             case SyntaxKind.PostDecrementExpression:
-            case SyntaxKind.SuppressNullableWarningExpression: break;
+            case SyntaxKind.SuppressNullableWarningExpression:
+            case SyntaxKind.PropagateExpression: break;
             default: throw new ArgumentException(nameof(kind));
         }
         if (operand == null) throw new ArgumentNullException(nameof(operand));
@@ -2629,7 +2636,8 @@ public static partial class SyntaxFactory
         {
             case SyntaxKind.PlusPlusToken:
             case SyntaxKind.MinusMinusToken:
-            case SyntaxKind.ExclamationToken: break;
+            case SyntaxKind.ExclamationToken:
+            case SyntaxKind.QuestionToken: break;
             default: throw new ArgumentException(nameof(operatorToken));
         }
         return (PostfixUnaryExpressionSyntax)Syntax.InternalSyntax.SyntaxFactory.PostfixUnaryExpression(kind, (Syntax.InternalSyntax.ExpressionSyntax)operand.Green, (Syntax.InternalSyntax.SyntaxToken)operatorToken.Node!).CreateRed();
@@ -2645,6 +2653,7 @@ public static partial class SyntaxFactory
             SyntaxKind.PostIncrementExpression => SyntaxKind.PlusPlusToken,
             SyntaxKind.PostDecrementExpression => SyntaxKind.MinusMinusToken,
             SyntaxKind.SuppressNullableWarningExpression => SyntaxKind.ExclamationToken,
+            SyntaxKind.PropagateExpression => SyntaxKind.QuestionToken,
             _ => throw new ArgumentOutOfRangeException(),
         };
 

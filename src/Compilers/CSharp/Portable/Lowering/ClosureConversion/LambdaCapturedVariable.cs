@@ -20,6 +20,9 @@ namespace Microsoft.CodeAnalysis.CSharp
     /// </summary>
     internal class LambdaCapturedVariable : SynthesizedFieldSymbolBase, ISynthesizedMethodBodyImplementationSymbol
     {
+        /// <summary>RustSharp: the variable this field holds, for the `mut` check.</summary>
+        internal Symbol CapturedSymbol { get; private set; }
+
         private readonly TypeWithAnnotations _type;
         private readonly bool _isThis;
 
@@ -50,9 +53,11 @@ namespace Microsoft.CodeAnalysis.CSharp
             string fieldName = GetCapturedVariableFieldName(captured, ref uniqueId);
             TypeSymbol type = GetCapturedVariableFieldType(frame, captured);
             bool isThis = IsThis(captured, out ParameterSymbol? parameter);
-            return parameter is not null && !isThis ?
+            var result = parameter is not null && !isThis ?
                 new LambdaCapturedVariableForRegularParameter(frame, TypeWithAnnotations.Create(type), fieldName, parameter) :
                 new LambdaCapturedVariable(frame, TypeWithAnnotations.Create(type), fieldName, isThis);
+            result.CapturedSymbol = captured;
+            return result;
         }
 
         private static bool IsThis(Symbol captured)

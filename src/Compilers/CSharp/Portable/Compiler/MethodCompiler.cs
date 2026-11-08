@@ -768,11 +768,13 @@ namespace Microsoft.CodeAnalysis.CSharp
                     try
                     {
                         // Local functions can be iterators as well as be async (lambdas can only be async), so we need to lower both iterators and async
-                        IteratorStateMachine iteratorStateMachine;
-                        BoundStatement loweredBody = IteratorRewriter.Rewrite(methodWithBody.Body, method, methodOrdinal, stateMachineStateDebugInfoBuilder, variableSlotAllocatorOpt, compilationState, diagnosticsThisMethod, out iteratorStateMachine);
+                        IteratorStateMachine iteratorStateMachine = null;
+                        bool nativeCoroutines = _moduleBeingBuiltOpt.BodySink is not null; // RustSharp: see LowerBodyOrInitializer
+                        BoundStatement loweredBody = nativeCoroutines ? methodWithBody.Body
+                            : IteratorRewriter.Rewrite(methodWithBody.Body, method, methodOrdinal, stateMachineStateDebugInfoBuilder, variableSlotAllocatorOpt, compilationState, diagnosticsThisMethod, out iteratorStateMachine);
                         StateMachineTypeSymbol stateMachine = iteratorStateMachine;
 
-                        if (!loweredBody.HasErrors)
+                        if (!loweredBody.HasErrors && !nativeCoroutines)
                         {
                             AsyncStateMachine asyncStateMachine = null;
                             if (compilationState.Compilation.IsRuntimeAsyncEnabledIn(method))
@@ -822,7 +824,7 @@ namespace Microsoft.CodeAnalysis.CSharp
                     if (_emitMethodBodies)
                     {
                         // error while generating IL
-                        if (emittedBody == null)
+                        if (emittedBody == null && _moduleBeingBuiltOpt.BodySink is null)
                         {
                             break;
                         }
@@ -1530,7 +1532,11 @@ namespace Microsoft.CodeAnalysis.CSharp
                     return loweredBody;
                 }
 
-                if (sawAwaitInExceptionHandler)
+                // RustSharp: native code keeps `await` and `yield` in the body. The borrow checker must see the
+                // code before it turns into a state machine, as in rustc; the backend builds coroutines.
+                bool nativeCoroutines = compilationState.ModuleBuilderOpt.BodySink is not null;
+
+                if (sawAwaitInExceptionHandler && !nativeCoroutines)
                 {
                     // If we have awaits in handlers, we need to
                     // replace handlers with synthetic ones which can be consumed by async rewriter.
@@ -1572,6 +1578,11 @@ namespace Microsoft.CodeAnalysis.CSharp
                 }
 
                 if (bodyWithoutLambdas.HasErrors)
+                {
+                    return bodyWithoutLambdas;
+                }
+
+                if (nativeCoroutines)
                 {
                     return bodyWithoutLambdas;
                 }
@@ -1630,6 +1641,13 @@ namespace Microsoft.CodeAnalysis.CSharp
             ImmutableArray<SourceSpan> codeCoverageSpans,
             SynthesizedEntryPointSymbol.AsyncForwardEntryPoint entryPointOpt)
         {
+            // RustSharp: native compilation takes the lowered body here, in front of the IL emitter.
+            if (moduleBuilder.BodySink is { } bodySink)
+            {
+                bodySink.Add(method, block);
+                return null;
+            }
+
             // Note: don't call diagnostics.HasAnyErrors() in release; could be expensive if compilation has many warnings.
             Debug.Assert(!diagnostics.HasAnyErrors(), "Running code generator when errors exist might be dangerous; code generator not expecting errors");
 

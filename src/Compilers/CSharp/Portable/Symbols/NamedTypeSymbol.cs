@@ -362,7 +362,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
 
                         // Tracked by https://github.com/dotnet/roslyn/issues/78827 : MQ, we should use similar logic when looking up new extension members
                         if ((thisParam.RefKind == RefKind.Ref && !thisParam.Type.IsValueType) ||
-                            (thisParam.RefKind is RefKind.In or RefKind.RefReadOnlyParameter && thisParam.Type.TypeKind != TypeKind.Struct))
+                            (thisParam.RefKind is RefKind.In or RefKind.RefReadOnlyParameter && thisParam.Type.TypeKind != TypeKind.Struct
+                                && ((CSharpParseOptions?)method.GetFirstLocationOrNone().SourceTree?.Options)?.IsOwnershipEnabled != true))
                         {
                             // For ref and ref-readonly extension methods, receivers need to be of the correct types to be considered in lookup
                             continue;

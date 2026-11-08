@@ -2260,6 +2260,19 @@ namespace Microsoft.CodeAnalysis.CSharp
         /// is either void or int.
         /// - has either no parameter or a single parameter of type string[]
         /// </summary>
+        internal static bool IsResultMain(MethodSymbol method, out bool inTask)
+        {
+            inTask = false;
+            if (method.DeclaringSyntaxReferences.FirstOrDefault()?.SyntaxTree.Options is not CSharpParseOptions { IsOwnershipEnabled: true }) return false;
+            var type = method.ReturnType as NamedTypeSymbol;
+            if (type is { Name: "Task", Arity: 1, ContainingNamespace.Name: "Tasks" })
+            {
+                inTask = true;
+                type = type.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics[0].Type as NamedTypeSymbol;
+            }
+            return type is { Name: "Result", Arity: 2, ContainingNamespace.Name: "System" };
+        }
+
         internal (bool IsCandidate, bool IsTaskLike) HasEntryPointSignature(MethodSymbol method, BindingDiagnosticBag bag)
         {
             if (method.IsVararg)
@@ -2269,7 +2282,12 @@ namespace Microsoft.CodeAnalysis.CSharp
 
             TypeSymbol returnType = method.ReturnType;
             bool returnsTaskOrTaskOfInt = false;
-            if (returnType.SpecialType != SpecialType.System_Int32 && !returnType.IsVoidType())
+            if (IsResultMain(method, out bool resultInTask))
+            {
+                // RustSharp: Rust's `fn main() -> Result<(), E>`; Ok exits with 0, Err prints "Error: ..." and exits with 1.
+                returnsTaskOrTaskOfInt = resultInTask;
+            }
+            else if (returnType.SpecialType != SpecialType.System_Int32 && !returnType.IsVoidType())
             {
                 // Never look for ReturnsAwaitableToVoidOrInt on int32 or void
                 returnsTaskOrTaskOfInt = ReturnsAwaitableToVoidOrInt(method, bag);

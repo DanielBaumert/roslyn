@@ -423,6 +423,8 @@ namespace Microsoft.CodeAnalysis.CSharp
         AllowsKeyword = 8450,
         /// <summary>Represents <see langword="extension"/>.</summary>
         ExtensionKeyword = 8451,
+        /// <summary>RustSharp: contextual <c>move</c> method modifier (the method consumes <c>this</c>).</summary>
+        MoveKeyword = 8452,
 
         // when adding a contextual keyword following functions must be adapted:
         // <see cref="SyntaxFacts.GetContextualKeywordKinds()"/>
@@ -530,6 +532,8 @@ namespace Microsoft.CodeAnalysis.CSharp
         Utf8StringLiteralToken = 8520,
         Utf8SingleLineRawStringLiteralToken = 8521,
         Utf8MultiLineRawStringLiteralToken = 8522,
+        /// <summary>RustSharp: a lifetime such as <c>'a</c>.</summary>
+        LifetimeToken = 8990,
         RazorContentToken = 8523,
 
         // trivia
@@ -893,6 +897,8 @@ namespace Microsoft.CodeAnalysis.CSharp
         ThrowExpression = 9052,
         ImplicitStackAllocArrayCreationExpression = 9053,
         SuppressNullableWarningExpression = 9054,
+        /// <summary>RustSharp: Rust's <c>expr?</c>, which returns early with the error.</summary>
+        PropagateExpression = 8991,
         NullableDirectiveTrivia = 9055,
 
         FunctionPointerType = 9056,

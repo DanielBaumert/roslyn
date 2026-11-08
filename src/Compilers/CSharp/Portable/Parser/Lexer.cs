@@ -399,6 +399,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
                     case SyntaxKind.Utf8MultiLineRawStringLiteralToken:
                         token = SyntaxFactory.Literal(leadingNode, info.Text, info.Kind, info.StringValue, trailingNode);
                         break;
+                    case SyntaxKind.LifetimeToken:
+                        token = SyntaxFactory.Literal(leadingNode, info.Text, info.Kind, info.StringValue, trailingNode);
+                        break;
                     case SyntaxKind.CharacterLiteralToken:
                         token = SyntaxFactory.Literal(leadingNode, info.Text, info.CharValue, trailingNode);
                         break;
@@ -452,6 +455,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
             character = TextWindow.PeekChar();
             switch (character)
             {
+                case '\'' when _options.IsOwnershipEnabled && TryScanLifetime(ref info):
+                    break;
+
                 case '\"':
                 case '\'':
                     this.ScanStringLiteral(ref info, inDirective: false);
@@ -1303,6 +1309,37 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
             _identBuffer = tmp;
         }
 
+        /// <summary>
+        /// RustSharp: <c>'a</c> is a lifetime, <c>'a'</c> stays a character literal. Only a quote, an
+        /// identifier and no closing quote make a lifetime, so existing char literals are unaffected.
+        /// </summary>
+        private bool TryScanLifetime(ref TokenInfo info)
+        {
+            int length = 1;
+            char first = TextWindow.PeekChar(length);
+            if (!SyntaxFacts.IsIdentifierStartCharacter(first))
+            {
+                return false;
+            }
+
+            while (SyntaxFacts.IsIdentifierPartCharacter(TextWindow.PeekChar(length)))
+            {
+                length++;
+            }
+
+            if (TextWindow.PeekChar(length) == '\'')
+            {
+                return false;
+            }
+
+            int start = TextWindow.Position;
+            TextWindow.AdvanceChar(length);
+            info.Kind = SyntaxKind.LifetimeToken;
+            info.Text = TextWindow.GetText(start, intern: true);
+            info.StringValue = info.Text;
+            return true;
+        }
+
         private bool ScanIdentifier(ref TokenInfo info)
         {
             return
@@ -1884,6 +1921,21 @@ LoopExit:
             }
         }
 
+        /// <summary>
+        /// RustSharp: `mut` followed by a word is the modifier. A variable called mut can still be used
+        /// wherever an operator or punctuation follows it.
+        /// </summary>
+        private bool IsMutModifier()
+        {
+            if (TextWindow.PeekChar(1) != 'u' || TextWindow.PeekChar(2) != 't' || SyntaxFacts.IsIdentifierPartCharacter(TextWindow.PeekChar(3))) return false;
+            int i = 3;
+            while (TextWindow.PeekChar(i) is ' ' or '\t') i++;
+            if (!SyntaxFacts.IsIdentifierStartCharacter(TextWindow.PeekChar(i))) return false;
+            var word = new System.Text.StringBuilder();
+            for (; SyntaxFacts.IsIdentifierPartCharacter(TextWindow.PeekChar(i)); i++) word.Append(TextWindow.PeekChar(i));
+            return word.ToString() is not ("is" or "as" or "in" or "switch" or "with" or "and" or "or");
+        }
+
         private void LexSyntaxTrivia(bool isFollowingToken, bool isTrailing, ref SyntaxListBuilder triviaList)
         {
             bool onlyWhitespaceOnLine = !isTrailing;
@@ -1895,6 +1947,15 @@ LoopExit:
                 if (ch == ' ')
                 {
                     this.AddTrivia(this.ScanWhitespace(), ref triviaList);
+                    continue;
+                }
+                else if (ch == 'm' && _options.IsOwnershipEnabled && IsMutModifier())
+                {
+                    // RustSharp: belongs to the declaration that follows, not to the token before it.
+                    if (isTrailing) return;
+                    TextWindow.AdvanceChar(3);
+                    this.AddTrivia(SyntaxFactory.Comment("mut"), ref triviaList);
+                    onlyWhitespaceOnLine = false;
                     continue;
                 }
                 else if (ch > 127)

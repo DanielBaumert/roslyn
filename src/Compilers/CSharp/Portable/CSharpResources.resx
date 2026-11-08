@@ -8196,4 +8196,121 @@ To remove the warning, you can use /reference instead (set the Embed Interop Typ
   <data name="ERR_AttributeCannotBeAppliedManually" xml:space="preserve">
     <value>'{0}' cannot be applied manually.</value>
   </data>
+  <data name="ERR_OwnUseOfMovedValue" xml:space="preserve">
+    <value>use of moved value: `{0}`</value>
+  </data>
+  <data name="ERR_OwnBorrowOfMovedValue" xml:space="preserve">
+    <value>borrow of moved value: `{0}`</value>
+  </data>
+  <data name="ERR_OwnMoveOutOfBorrow" xml:space="preserve">
+    <value>cannot move out of `{0}`, which is behind a {1}</value>
+  </data>
+  <data name="ERR_OwnMoveOutOfIndex" xml:space="preserve">
+    <value>cannot move out of array element `{0}`</value>
+  </data>
+  <data name="ERR_OwnMoveOutOfStatic" xml:space="preserve">
+    <value>cannot move out of static field `{0}`</value>
+  </data>
+  <data name="ERR_OwnMoveOutOfDropType" xml:space="preserve">
+    <value>cannot move out of `{0}`, because its type `{1}` has a destructor</value>
+  </data>
+  <data name="ERR_OwnMoveWhileBorrowed" xml:space="preserve">
+    <value>cannot move out of `{0}` because it is borrowed</value>
+  </data>
+  <data name="ERR_OwnAssignToBorrowed" xml:space="preserve">
+    <value>cannot assign to `{0}` because it is borrowed</value>
+  </data>
+  <data name="ERR_OwnUseWhileMutBorrowed" xml:space="preserve">
+    <value>cannot use `{0}` because it is mutably borrowed</value>
+  </data>
+  <data name="ERR_OwnMutBorrowWhileShared" xml:space="preserve">
+    <value>cannot borrow `{0}` as mutable because it is also borrowed as immutable</value>
+  </data>
+  <data name="ERR_OwnSharedBorrowWhileMut" xml:space="preserve">
+    <value>cannot borrow `{0}` as immutable because it is also borrowed as mutable</value>
+  </data>
+  <data name="ERR_OwnDoubleMutBorrow" xml:space="preserve">
+    <value>cannot borrow `{0}` as mutable more than once at a time</value>
+  </data>
+  <data name="ERR_OwnDoesNotLiveLongEnough" xml:space="preserve">
+    <value>`{0}` does not live long enough</value>
+  </data>
+  <data name="ERR_OwnTemporaryDropped" xml:space="preserve">
+    <value>temporary value dropped while borrowed</value>
+  </data>
+  <data name="ERR_OwnReturnRefToLocal" xml:space="preserve">
+    <value>cannot return a reference to local `{0}`</value>
+  </data>
+  <data name="ERR_OwnLifetimeMismatch" xml:space="preserve">
+    <value>lifetime may not live long enough: `{0}` must outlive `{1}`</value>
+  </data>
+  <data name="ERR_OwnMissingLifetimeSpecifier" xml:space="preserve">
+    <value>missing lifetime specifier: the return value borrows from one of several inputs, name it with a lifetime or mark the others `scoped`</value>
+  </data>
+  <data name="ERR_OwnAssignThroughShared" xml:space="preserve">
+    <value>cannot assign to `{0}`, which is behind a shared reference</value>
+  </data>
+  <data name="ERR_OwnMutBorrowThroughShared" xml:space="preserve">
+    <value>cannot borrow `{0}` as mutable, because it is behind a shared reference</value>
+  </data>
+  <data name="ERR_OwnOwnershipUnsupported" xml:space="preserve">
+    <value>not supported in ownership mode: {0}</value>
+  </data>
+  <data name="ERR_OwnReadonlyOverrideMismatch" xml:space="preserve">
+    <value>`{0}` must be `readonly` because the method it overrides or implements is</value>
+  </data>
+  <data name="ERR_OwnRequiresUnsafe" xml:space="preserve">
+    <value>{0} requires an `unsafe` context</value>
+  </data>
+  <data name="ERR_OwnNotClone" xml:space="preserve">
+    <value>`{0}` does not implement Clone</value>
+  </data>
+  <data name="ERR_OwnNotSend" xml:space="preserve">
+    <value>`{0}` cannot be sent between threads safely</value>
+  </data>
+  <data name="ERR_OwnNotSync" xml:space="preserve">
+    <value>`{0}` cannot be shared between threads safely</value>
+  </data>
+  <data name="ERR_OwnClosureOutlives" xml:space="preserve">
+    <value>closure may outlive the current function, but it borrows `{0}`</value>
+  </data>
+  <data name="ERR_OwnMustNotSuspend" xml:space="preserve">
+    <value>`{0}` must not be held across an `await`</value>
+  </data>
+  <data name="ERR_OwnNoNull" xml:space="preserve">
+    <value>`null` does not exist: every reference has a value. A value that may be missing is an Option&lt;T&gt;: write `None` (or `Option&lt;T&gt;.None`), and `Some(value)` when there is one</value>
+  </data>
+  <data name="ERR_OwnNoNullableContext" xml:space="preserve">
+    <value>`#nullable` does not exist: references are never null, so there is nothing to switch on or off. A value that may be missing is an Option&lt;T&gt;</value>
+  </data>
+  <data name="ERR_OwnNoNullOperator" xml:space="preserve">
+    <value>`{0}` works on null, and there is no null: {1}</value>
+  </data>
+  <data name="ERR_OwnNullDefault" xml:space="preserve">
+    <value>{0} would hold null, and there is no null: `{1}` has no value of its own. {2}</value>
+  </data>
+  <data name="ERR_OwnNoInheritance" xml:space="preserve">
+    <value>there is no inheritance: implement an interface (a trait), or use an enum with data</value>
+  </data>
+  <data name="ERR_OwnNoDynamic" xml:space="preserve">
+    <value>`dynamic` does not exist: use an interface for dynamic dispatch (Rust's `dyn Trait`), or `object` with `is` to look at the type (Rust's `dyn Any`)</value>
+  </data>
+  <data name="ERR_OwnNoExceptions" xml:space="preserve">
+    <value>there are no exceptions: return a Result for errors, and call Panic.Raise for bugs</value>
+  </data>
+  <data name="ERR_OwnPropagateOperand" xml:space="preserve">
+    <value>the `?` operator can only be applied to a Result or an Option, not to `{0}`</value>
+  </data>
+  <data name="ERR_OwnPropagateReturn" xml:space="preserve">
+    <value>the `?` operator can only be used in a method that returns {0}</value>
+  </data>
+  <data name="ERR_OwnAssignImmutable" xml:space="preserve">
+    <value>cannot assign twice to immutable variable `{0}`</value>
+  </data>
+  <data name="ERR_OwnBorrowImmutable" xml:space="preserve">
+    <value>`{0}` is not declared `mut`, so it cannot change</value>
+  </data>
+  <data name="ERR_OwnClosureMutates" xml:space="preserve">
+    <value>this lambda changes `{0}`, so its delegate type must be [Mut]</value>
+  </data>
 </root>

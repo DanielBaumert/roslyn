@@ -733,6 +733,15 @@ namespace Microsoft.CodeAnalysis.CSharp
         /// </summary>
         private BoundExpression CheckValue(BoundExpression expr, BindValueKind valueKind, BindingDiagnosticBag diagnostics)
         {
+            // RustSharp: a variant without data is a value, as Rust's `Abx::A`.
+            if (expr is BoundTypeExpression { Type: NamedTypeSymbol unit } && UnionSyntax.IsVariant(unit, unitOnly: true)
+                && ((CSharpParseOptions)expr.Syntax.SyntaxTree.Options).IsOwnershipEnabled)
+            {
+                var none = AnalyzedArguments.GetInstance();
+                try { return BindClassCreationExpression(expr.Syntax, unit.Name, expr.Syntax, unit, none, diagnostics); }
+                finally { none.Free(); }
+            }
+
             switch (expr.Kind)
             {
                 case BoundKind.PropertyGroup:

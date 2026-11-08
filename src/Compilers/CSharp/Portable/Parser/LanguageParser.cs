@@ -1355,6 +1355,11 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
             }
         }
 
+        private static bool IsMoveModifierFollower(SyntaxToken next)
+            => next.Kind is SyntaxKind.IdentifierToken or SyntaxKind.VoidKeyword or SyntaxKind.RefKeyword or SyntaxKind.LifetimeToken
+               || SyntaxFacts.IsPredefinedType(next.Kind)
+               || GetModifierExcludingScoped(next) != DeclarationModifiers.None;
+
         private void ParseModifiers(SyntaxListBuilder tokens, bool forAccessors, bool forTopLevelStatements, out bool isPossibleTypeDeclaration)
         {
             Debug.Assert(!(forAccessors && forTopLevelStatements));
@@ -1363,6 +1368,25 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
 
             while (true)
             {
+                if (this.Options.IsOwnershipEnabled)
+                {
+                    // RustSharp: `'a View Make(...)` names the lifetime of a returned ref struct.
+                    if (this.CurrentToken.Kind == SyntaxKind.LifetimeToken)
+                    {
+                        isPossibleTypeDeclaration = false;
+                        tokens.Add(this.EatToken());
+                        continue;
+                    }
+
+                    // RustSharp: `move T Into()` consumes the receiver.
+                    if (this.CurrentToken.ContextualKind == SyntaxKind.MoveKeyword && IsMoveModifierFollower(this.PeekToken(1)))
+                    {
+                        isPossibleTypeDeclaration = false;
+                        tokens.Add(ConvertToKeyword(this.EatToken()));
+                        continue;
+                    }
+                }
+
                 var newMod = GetModifierExcludingScoped(this.CurrentToken);
 
                 Debug.Assert(newMod != DeclarationModifiers.Scoped);
@@ -1711,6 +1735,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
 
                 case SyntaxKind.DelegateKeyword:
                     return this.ParseDelegateDeclaration(attributes, modifiers);
+
+                case SyntaxKind.EnumKeyword when this.Options.IsOwnershipEnabled && IsUnionEnum():
+                    return this.ParseUnionDeclaration(attributes, modifiers);
 
                 case SyntaxKind.EnumKeyword:
                     return this.ParseEnumDeclaration(attributes, modifiers);
@@ -2360,6 +2387,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
         {
             switch (kind)
             {
+                case SyntaxKind.LifetimeToken:
                 case SyntaxKind.AbstractKeyword:
                 case SyntaxKind.BoolKeyword:
                 case SyntaxKind.ByteKeyword:
@@ -3535,6 +3563,16 @@ parse_member_name:;
             _termState |= TerminatorState.IsEndOfMethodSignature;
 
             var paramList = this.ParseParenthesizedParameterList(forExtension: false);
+
+            // RustSharp: `where 'a : 'b`. Lifetimes are no type parameters, so the clause stays out of the
+            // tree proper and the ownership analysis reads it from the skipped tokens.
+            while (this.Options.IsOwnershipEnabled && this.CurrentToken.ContextualKind == SyntaxKind.WhereKeyword && this.PeekToken(1).Kind == SyntaxKind.LifetimeToken)
+            {
+                paramList = AddTrailingSkippedSyntax(paramList, this.EatToken());
+                paramList = AddTrailingSkippedSyntax(paramList, this.EatToken());
+                paramList = AddTrailingSkippedSyntax(paramList, this.EatToken(SyntaxKind.ColonToken));
+                paramList = AddTrailingSkippedSyntax(paramList, this.EatToken(SyntaxKind.LifetimeToken));
+            }
 
             var constraints = default(SyntaxListBuilder<TypeParameterConstraintClauseSyntax>);
             if (this.CurrentToken.ContextualKind == SyntaxKind.WhereKeyword)
@@ -4851,6 +4889,7 @@ parse_member_name:;
                 case SyntaxKind.InKeyword:
                 case SyntaxKind.ParamsKeyword:
                 case SyntaxKind.ReadOnlyKeyword:
+                case SyntaxKind.LifetimeToken:
                     return true;
             }
 
@@ -4880,7 +4919,7 @@ parse_member_name:;
                     modifiers.Add(scopedKeyword);
 
                     // Look if ref/out/in/readonly are next
-                    while (this.CurrentToken.Kind is SyntaxKind.RefKeyword or SyntaxKind.OutKeyword or SyntaxKind.InKeyword or SyntaxKind.ReadOnlyKeyword)
+                    while (this.CurrentToken.Kind is SyntaxKind.RefKeyword or SyntaxKind.OutKeyword or SyntaxKind.InKeyword or SyntaxKind.ReadOnlyKeyword or SyntaxKind.LifetimeToken)
                     {
                         modifiers.Add(this.EatToken());
                     }
@@ -5632,6 +5671,99 @@ parse_member_name:;
                 parameterList,
                 _pool.ToListAndFree(constraints),
                 this.EatToken(SyntaxKind.SemicolonToken));
+        }
+
+        /// <summary>
+        /// RustSharp: Rust's enum. An enum is one when a variant carries data (`Circle(double R)`), when it
+        /// implements a trait (`enum Abx : ICool<int>`), or when methods follow its variants after a `;`.
+        /// </summary>
+        private bool IsUnionEnum()
+        {
+            int depth = 0;
+            for (int i = 1; i < 100000; i++)
+            {
+                var token = this.PeekToken(i);
+                // `enum E : ITrait`: an interface, not the underlying integer type of a C# enum.
+                if (depth == 0 && token.Kind == SyntaxKind.ColonToken)
+                    return this.PeekToken(i + 1).Kind == SyntaxKind.IdentifierToken;
+                switch (token.Kind)
+                {
+                    case SyntaxKind.EndOfFileToken:
+                        return false;
+                    case SyntaxKind.OpenBraceToken:
+                        depth++;
+                        break;
+                    case SyntaxKind.CloseBraceToken:
+                        if (--depth <= 0) return false;
+                        break;
+                    case SyntaxKind.SemicolonToken when depth == 1:
+                        return true;
+                    case SyntaxKind.IdentifierToken when depth == 1 && this.PeekToken(i + 1).Kind == SyntaxKind.OpenParenToken:
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// RustSharp: Rust's enum with data. `enum Shape { Circle(double R), Empty }` becomes an abstract record
+        /// with one sealed record per variant. The `enum` keyword and the commas stay in the tree as skipped
+        /// tokens, so the text is unchanged. After a `;`, members follow as in Rust's `impl` block.
+        /// </summary>
+        private MemberDeclarationSyntax ParseUnionDeclaration(SyntaxList<AttributeListSyntax> attributes, SyntaxListBuilder modifiers)
+        {
+            var enumToken = this.EatToken(SyntaxKind.EnumKeyword);
+            var keyword = AddLeadingSkippedSyntax(SyntaxFactory.MissingToken(SyntaxKind.RecordKeyword), enumToken);
+            modifiers.Add(SyntaxFactory.MissingToken(SyntaxKind.AbstractKeyword));
+            var name = this.ParseIdentifierToken();
+            var typeParameters = this.ParseTypeParameterList();
+            var baseList = this.ParseBaseList();
+
+            var constraints = _pool.Allocate<TypeParameterConstraintClauseSyntax>();
+            if (this.CurrentToken.ContextualKind == SyntaxKind.WhereKeyword) this.ParseTypeParameterConstraintClauses(constraints);
+
+            var openBrace = this.EatToken(SyntaxKind.OpenBraceToken);
+            var members = _pool.Allocate<MemberDeclarationSyntax>();
+            while (this.CurrentToken.Kind == SyntaxKind.IdentifierToken)
+            {
+                var variantName = this.ParseIdentifierToken();
+                var paramList = this.CurrentToken.Kind == SyntaxKind.OpenParenToken ? this.ParseParenthesizedParameterList(forExtension: false) : null;
+                var variantModifiers = _pool.Allocate();
+                variantModifiers.Add(SyntaxFactory.MissingToken(SyntaxKind.PublicKeyword));
+                variantModifiers.Add(SyntaxFactory.MissingToken(SyntaxKind.SealedKeyword));
+                var end = SyntaxFactory.MissingToken(SyntaxKind.SemicolonToken);
+                if (this.CurrentToken.Kind == SyntaxKind.CommaToken) end = AddLeadingSkippedSyntax(end, this.EatToken());
+                members.Add(_syntaxFactory.RecordDeclaration(
+                    SyntaxKind.RecordDeclaration, default, variantModifiers.ToList(), SyntaxFactory.MissingToken(SyntaxKind.RecordKeyword),
+                    classOrStructKeyword: null, variantName, typeParameterList: null, paramList, baseList: null, default,
+                    openBraceToken: null, default, closeBraceToken: null, end));
+                _pool.Free(variantModifiers);
+            }
+
+            if (this.CurrentToken.Kind == SyntaxKind.SemicolonToken && members.Count > 0)
+            {
+                members[members.Count - 1] = (MemberDeclarationSyntax)AddTrailingSkippedSyntax((CSharpSyntaxNode)members[members.Count - 1], this.EatToken());
+                while (this.CurrentToken.Kind is not (SyntaxKind.CloseBraceToken or SyntaxKind.EndOfFileToken))
+                {
+                    var member = this.ParseMemberDeclaration(SyntaxKind.RecordDeclaration);
+                    if (member is null)
+                    {
+                        this.SkipBadMemberListTokens(ref openBrace, members);
+                        if (this.CurrentToken.Kind is SyntaxKind.CloseBraceToken or SyntaxKind.EndOfFileToken) break;
+                        continue;
+                    }
+                    members.Add(member);
+                }
+            }
+
+            var closeBrace = this.EatToken(SyntaxKind.CloseBraceToken);
+            var semicolon = this.TryEatToken(SyntaxKind.SemicolonToken);
+            var result = _syntaxFactory.RecordDeclaration(
+                SyntaxKind.RecordDeclaration, attributes, modifiers.ToList(), keyword, classOrStructKeyword: null, name, typeParameters,
+                parameterList: null, baseList, constraints, openBrace, members, closeBrace, semicolon);
+            _pool.Free(members);
+            _pool.Free(constraints);
+            return result;
         }
 
         private EnumDeclarationSyntax ParseEnumDeclaration(SyntaxList<AttributeListSyntax> attributes, SyntaxListBuilder modifiers)
@@ -7359,6 +7491,7 @@ done:
                 return _syntaxFactory.RefType(
                     this.EatToken(),
                     this.CurrentToken.Kind == SyntaxKind.ReadOnlyKeyword ? this.EatToken() : null,
+                    this.CurrentToken.Kind == SyntaxKind.LifetimeToken ? this.EatToken() : null,
                     ParseTypeCore(ParseTypeMode.AfterRef));
             }
 
@@ -11036,6 +11169,7 @@ done:
                 case SyntaxKind.StringLiteralExpression:
                 case SyntaxKind.Utf8StringLiteralExpression:
                 case SyntaxKind.SuppressNullableWarningExpression:
+                case SyntaxKind.PropagateExpression:
                 case SyntaxKind.ThisExpression:
                 case SyntaxKind.TrueLiteralExpression:
                 case SyntaxKind.TupleExpression:
@@ -11639,6 +11773,11 @@ done:
 
             ExpressionSyntax parsePrimaryExpressionWithoutPostfix(Precedence precedence)
             {
+                if (IsMoveLambdaStart())
+                {
+                    return this.ParseLambdaExpression();
+                }
+
                 var tk = this.CurrentToken.Kind;
                 switch (tk)
                 {
@@ -11865,6 +12004,11 @@ done:
                             expr = _syntaxFactory.MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, expr, this.EatToken(), this.ParseSimpleName(NameOptions.InExpression));
                             continue;
 
+                        case SyntaxKind.QuestionToken when IsPropagateQuestion():
+                            // RustSharp: Rust's error propagation, `x?`.
+                            expr = _syntaxFactory.PostfixUnaryExpression(SyntaxKind.PropagateExpression, expr, this.EatToken());
+                            continue;
+
                         case SyntaxKind.QuestionToken:
                             if (TryParseConditionalAccessExpression(expr, out var conditionalAccess))
                             {
@@ -11883,6 +12027,42 @@ done:
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// RustSharp: a `?` is the propagation operator unless a `:` follows before the statement or the
+        /// enclosing bracket ends, which makes it a conditional. `?.` and `?[` stay null-conditional.
+        /// </summary>
+        private bool IsPropagateQuestion()
+        {
+            if (!this.Options.IsOwnershipEnabled) return false;
+            if (this.PeekToken(1).Kind is SyntaxKind.DotToken or SyntaxKind.OpenBracketToken) return false;
+            int depth = 0;
+            for (int i = 1; i < 4096; i++)
+            {
+                switch (this.PeekToken(i).Kind)
+                {
+                    case SyntaxKind.OpenParenToken:
+                    case SyntaxKind.OpenBracketToken:
+                    case SyntaxKind.OpenBraceToken:
+                        depth++;
+                        break;
+                    case SyntaxKind.CloseParenToken:
+                    case SyntaxKind.CloseBracketToken:
+                    case SyntaxKind.CloseBraceToken:
+                        if (depth == 0) return true;
+                        depth--;
+                        break;
+                    case SyntaxKind.SemicolonToken:
+                    case SyntaxKind.EndOfFileToken:
+                        return true;
+                    case SyntaxKind.ColonToken:
+                        // Commas do not end the search: `c ? F<int, int>() : x` has one inside a type.
+                        if (depth == 0) return false;
+                        break;
+                }
+            }
+            return false;
         }
 
         private ExpressionSyntax ParseBaseExpression()
@@ -13419,12 +13599,60 @@ done:
             }
         }
 
+        /// <summary>RustSharp: `move x => ...`, `move (a, b) => ...`: a closure that owns what it captures.</summary>
+        private bool IsMoveLambdaStart()
+        {
+            if (!this.Options.IsOwnershipEnabled || this.CurrentToken.ContextualKind != SyntaxKind.MoveKeyword)
+            {
+                return false;
+            }
+
+            var next = this.PeekToken(1);
+            if (next.Kind == SyntaxKind.IdentifierToken && next.ContextualKind != SyntaxKind.AsyncKeyword)
+            {
+                return this.PeekToken(2).Kind == SyntaxKind.EqualsGreaterThanToken;
+            }
+
+            int i = 1;
+            if (next.ContextualKind == SyntaxKind.AsyncKeyword)
+            {
+                i = 2;
+                next = this.PeekToken(2);
+                if (next.Kind == SyntaxKind.IdentifierToken)
+                {
+                    return this.PeekToken(3).Kind == SyntaxKind.EqualsGreaterThanToken;
+                }
+            }
+
+            if (next.Kind != SyntaxKind.OpenParenToken)
+            {
+                return false;
+            }
+
+            int depth = 0;
+            for (; ; i++)
+            {
+                var kind = this.PeekToken(i).Kind;
+                if (kind == SyntaxKind.OpenParenToken) depth++;
+                else if (kind == SyntaxKind.CloseParenToken && --depth == 0) break;
+                else if (kind == SyntaxKind.EndOfFileToken) return false;
+            }
+
+            return this.PeekToken(i + 1).Kind == SyntaxKind.EqualsGreaterThanToken;
+        }
+
         private SyntaxList<SyntaxToken> ParseAnonymousFunctionModifiers()
         {
             var modifiers = _pool.Allocate();
 
             while (true)
             {
+                if (IsMoveLambdaStart())
+                {
+                    modifiers.Add(ConvertToKeyword(this.EatToken()));
+                    continue;
+                }
+
                 if (this.CurrentToken.Kind == SyntaxKind.StaticKeyword)
                 {
                     modifiers.Add(this.EatToken(SyntaxKind.StaticKeyword));

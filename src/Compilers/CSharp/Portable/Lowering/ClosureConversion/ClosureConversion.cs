@@ -1682,6 +1682,12 @@ namespace Microsoft.CodeAnalysis.CSharp
                 lambdaScope != Analysis.GetScopeParent(_analysis.ScopeTree, node.Body).BoundNode &&
                 InLoopOrLambda(node.Syntax, lambdaScope.Syntax);
 
+            // RustSharp: delegates are owned values, so one cached instance cannot be handed out repeatedly.
+            if (CompilationState.ModuleBuilderOpt?.BodySink is not null)
+            {
+                shouldCacheForStaticMethod = shouldCacheInLoop = false;
+            }
+
             if (shouldCacheForStaticMethod || shouldCacheInLoop)
             {
                 // replace the expression "new Delegate(frame.M)" with "frame.cache ?? (frame.cache = new Delegate(frame.M));

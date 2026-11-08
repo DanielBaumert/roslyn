@@ -445,7 +445,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
                 }
             }
 
-            if (containingType.IsStructType())
+            if (containingType.IsStructType() || ((CSharpParseOptions?)location.SourceTree?.Options)?.IsOwnershipEnabled == true)
             {
                 allowedModifiers |= DeclarationModifiers.ReadOnly;
             }

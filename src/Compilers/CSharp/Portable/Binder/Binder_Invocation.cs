@@ -190,6 +190,19 @@ namespace Microsoft.CodeAnalysis.CSharp
                 return result; // all of the binding is done by BindNameofOperator
             }
 
+            // RustSharp: `Shape.Circle(2)` builds a variant, as Rust's `Shape::Circle(2.0)`.
+            if (((CSharpParseOptions)node.SyntaxTree.Options).IsOwnershipEnabled && node.Expression is MemberAccessExpressionSyntax or IdentifierNameSyntax or GenericNameSyntax
+                && BindExpression(node.Expression, BindingDiagnosticBag.Discarded) is BoundTypeExpression { Type: NamedTypeSymbol variant } && UnionSyntax.IsVariant(variant, unitOnly: false))
+            {
+                var arguments = AnalyzedArguments.GetInstance();
+                try
+                {
+                    BindArgumentsAndNames(node.ArgumentList, diagnostics, arguments);
+                    return BindClassCreationExpression(node, variant.Name, node.Expression, variant, arguments, diagnostics);
+                }
+                finally { arguments.Free(); }
+            }
+
             // M(__arglist()) is legal, but M(__arglist(__arglist()) is not!
             bool isArglist = node.Expression.Kind() == SyntaxKind.ArgListExpression;
             AnalyzedArguments analyzedArguments = AnalyzedArguments.GetInstance();

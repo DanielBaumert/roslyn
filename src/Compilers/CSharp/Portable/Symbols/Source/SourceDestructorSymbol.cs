@@ -53,7 +53,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
             {
                 diagnostics.Add(ErrorCode.ERR_DestructorInStaticClass, location);
             }
-            else if (!containingType.IsReferenceType)
+            else if (!containingType.IsReferenceType && ((CSharpParseOptions?)location.SourceTree?.Options)?.IsOwnershipEnabled != true)
             {
                 diagnostics.Add(ErrorCode.ERR_OnlyClassesCanContainDestructors, location);
             }

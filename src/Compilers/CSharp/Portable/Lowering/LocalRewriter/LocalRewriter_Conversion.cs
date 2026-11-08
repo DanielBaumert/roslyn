@@ -578,6 +578,7 @@ namespace Microsoft.CodeAnalysis.CSharp
                         if (_factory.Compilation.LanguageVersion >= MessageID.IDS_FeatureCacheStaticMethodGroupConversion.RequiredVersion()
                             && !_inExpressionLambda // The tree structure / meaning for expression trees should remain untouched.
                             && _factory.TopLevelMethod.MethodKind != MethodKind.StaticConstructor // Avoid caching twice if people do it manually.
+                            && _factory.CompilationState.ModuleBuilderOpt?.BodySink is null // RustSharp: a cached delegate would be shared, and delegates are owned
                             && DelegateCacheRewriter.CanRewrite(boundDelegateCreation))
                         {
                             var rewriter = _lazyDelegateCacheRewriter ??= new DelegateCacheRewriter(_factory, _topLevelMethodOrdinal);

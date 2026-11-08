@@ -301,6 +301,14 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
         {
             get
             {
+                // RustSharp: `foreach (mut var x in ...)`, Rust's `for mut x in`.
+                if (this.DeclarationKind == LocalDeclarationKind.ForEachIterationVariable
+                    && this.GetDeclaratorSyntax() is { } syntax
+                    && Ownership.MutabilityChecker.HasMut(syntax, out _))
+                {
+                    return true;
+                }
+
                 switch (this.DeclarationKind)
                 {
                     case LocalDeclarationKind.Constant:

@@ -1592,12 +1592,13 @@ internal sealed partial class RefTypeSyntax : TypeSyntax
 {
     internal readonly SyntaxToken refKeyword;
     internal readonly SyntaxToken? readOnlyKeyword;
+    internal readonly SyntaxToken? lifetimeToken;
     internal readonly TypeSyntax type;
 
-    internal RefTypeSyntax(SyntaxKind kind, SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, TypeSyntax type, DiagnosticInfo[]? diagnostics, SyntaxAnnotation[]? annotations)
+    internal RefTypeSyntax(SyntaxKind kind, SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, SyntaxToken? lifetimeToken, TypeSyntax type, DiagnosticInfo[]? diagnostics, SyntaxAnnotation[]? annotations)
       : base(kind, diagnostics, annotations)
     {
-        this.SlotCount = 3;
+        this.SlotCount = 4;
         this.AdjustFlagsAndWidth(refKeyword);
         this.refKeyword = refKeyword;
         if (readOnlyKeyword != null)
@@ -1605,15 +1606,20 @@ internal sealed partial class RefTypeSyntax : TypeSyntax
             this.AdjustFlagsAndWidth(readOnlyKeyword);
             this.readOnlyKeyword = readOnlyKeyword;
         }
+        if (lifetimeToken != null)
+        {
+            this.AdjustFlagsAndWidth(lifetimeToken);
+            this.lifetimeToken = lifetimeToken;
+        }
         this.AdjustFlagsAndWidth(type);
         this.type = type;
     }
 
-    internal RefTypeSyntax(SyntaxKind kind, SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, TypeSyntax type, SyntaxFactoryContext context)
+    internal RefTypeSyntax(SyntaxKind kind, SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, SyntaxToken? lifetimeToken, TypeSyntax type, SyntaxFactoryContext context)
       : base(kind)
     {
         this.SetFactoryContext(context);
-        this.SlotCount = 3;
+        this.SlotCount = 4;
         this.AdjustFlagsAndWidth(refKeyword);
         this.refKeyword = refKeyword;
         if (readOnlyKeyword != null)
@@ -1621,20 +1627,30 @@ internal sealed partial class RefTypeSyntax : TypeSyntax
             this.AdjustFlagsAndWidth(readOnlyKeyword);
             this.readOnlyKeyword = readOnlyKeyword;
         }
+        if (lifetimeToken != null)
+        {
+            this.AdjustFlagsAndWidth(lifetimeToken);
+            this.lifetimeToken = lifetimeToken;
+        }
         this.AdjustFlagsAndWidth(type);
         this.type = type;
     }
 
-    internal RefTypeSyntax(SyntaxKind kind, SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, TypeSyntax type)
+    internal RefTypeSyntax(SyntaxKind kind, SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, SyntaxToken? lifetimeToken, TypeSyntax type)
       : base(kind)
     {
-        this.SlotCount = 3;
+        this.SlotCount = 4;
         this.AdjustFlagsAndWidth(refKeyword);
         this.refKeyword = refKeyword;
         if (readOnlyKeyword != null)
         {
             this.AdjustFlagsAndWidth(readOnlyKeyword);
             this.readOnlyKeyword = readOnlyKeyword;
+        }
+        if (lifetimeToken != null)
+        {
+            this.AdjustFlagsAndWidth(lifetimeToken);
+            this.lifetimeToken = lifetimeToken;
         }
         this.AdjustFlagsAndWidth(type);
         this.type = type;
@@ -1643,6 +1659,8 @@ internal sealed partial class RefTypeSyntax : TypeSyntax
     public SyntaxToken RefKeyword => this.refKeyword;
     /// <summary>Gets the optional "readonly" keyword.</summary>
     public SyntaxToken? ReadOnlyKeyword => this.readOnlyKeyword;
+    /// <summary>RustSharp: gets the optional lifetime, e.g. 'a.</summary>
+    public SyntaxToken? LifetimeToken => this.lifetimeToken;
     public TypeSyntax Type => this.type;
 
     internal override GreenNode? GetSlot(int index)
@@ -1650,7 +1668,8 @@ internal sealed partial class RefTypeSyntax : TypeSyntax
         {
             0 => this.refKeyword,
             1 => this.readOnlyKeyword,
-            2 => this.type,
+            2 => this.lifetimeToken,
+            3 => this.type,
             _ => null,
         };
 
@@ -1659,11 +1678,11 @@ internal sealed partial class RefTypeSyntax : TypeSyntax
     public override void Accept(CSharpSyntaxVisitor visitor) => visitor.VisitRefType(this);
     public override TResult Accept<TResult>(CSharpSyntaxVisitor<TResult> visitor) => visitor.VisitRefType(this);
 
-    public RefTypeSyntax Update(SyntaxToken refKeyword, SyntaxToken readOnlyKeyword, TypeSyntax type)
+    public RefTypeSyntax Update(SyntaxToken refKeyword, SyntaxToken readOnlyKeyword, SyntaxToken lifetimeToken, TypeSyntax type)
     {
-        if (refKeyword != this.RefKeyword || readOnlyKeyword != this.ReadOnlyKeyword || type != this.Type)
+        if (refKeyword != this.RefKeyword || readOnlyKeyword != this.ReadOnlyKeyword || lifetimeToken != this.LifetimeToken || type != this.Type)
         {
-            var newNode = SyntaxFactory.RefType(refKeyword, readOnlyKeyword, type);
+            var newNode = SyntaxFactory.RefType(refKeyword, readOnlyKeyword, lifetimeToken, type);
             var diags = GetDiagnostics();
             if (diags?.Length > 0)
                 newNode = newNode.WithDiagnosticsGreen(diags);
@@ -1677,10 +1696,10 @@ internal sealed partial class RefTypeSyntax : TypeSyntax
     }
 
     internal override GreenNode SetDiagnostics(DiagnosticInfo[]? diagnostics)
-        => new RefTypeSyntax(this.Kind, this.refKeyword, this.readOnlyKeyword, this.type, diagnostics, GetAnnotations());
+        => new RefTypeSyntax(this.Kind, this.refKeyword, this.readOnlyKeyword, this.lifetimeToken, this.type, diagnostics, GetAnnotations());
 
     internal override GreenNode SetAnnotations(SyntaxAnnotation[]? annotations)
-        => new RefTypeSyntax(this.Kind, this.refKeyword, this.readOnlyKeyword, this.type, GetDiagnostics(), annotations);
+        => new RefTypeSyntax(this.Kind, this.refKeyword, this.readOnlyKeyword, this.lifetimeToken, this.type, GetDiagnostics(), annotations);
 }
 
 /// <summary>The 'scoped' modifier of a local.</summary>
@@ -27500,7 +27519,7 @@ internal partial class CSharpSyntaxRewriter : CSharpSyntaxVisitor<CSharpSyntaxNo
         => node.Update((SyntaxToken)Visit(node.OmittedTypeArgumentToken));
 
     public override CSharpSyntaxNode VisitRefType(RefTypeSyntax node)
-        => node.Update((SyntaxToken)Visit(node.RefKeyword), (SyntaxToken)Visit(node.ReadOnlyKeyword), (TypeSyntax)Visit(node.Type));
+        => node.Update((SyntaxToken)Visit(node.RefKeyword), (SyntaxToken)Visit(node.ReadOnlyKeyword), (SyntaxToken)Visit(node.LifetimeToken), (TypeSyntax)Visit(node.Type));
 
     public override CSharpSyntaxNode VisitScopedType(ScopedTypeSyntax node)
         => node.Update((SyntaxToken)Visit(node.ScopedKeyword), (TypeSyntax)Visit(node.Type));
@@ -28601,7 +28620,7 @@ internal partial class ContextAwareSyntax
         return result;
     }
 
-    public RefTypeSyntax RefType(SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, TypeSyntax type)
+    public RefTypeSyntax RefType(SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, SyntaxToken? lifetimeToken, TypeSyntax type)
     {
 #if DEBUG
         if (refKeyword == null) throw new ArgumentNullException(nameof(refKeyword));
@@ -28615,20 +28634,19 @@ internal partial class ContextAwareSyntax
                 default: throw new ArgumentException(nameof(readOnlyKeyword));
             }
         }
+        if (lifetimeToken != null)
+        {
+            switch (lifetimeToken.Kind)
+            {
+                case SyntaxKind.LifetimeToken:
+                case SyntaxKind.None: break;
+                default: throw new ArgumentException(nameof(lifetimeToken));
+            }
+        }
         if (type == null) throw new ArgumentNullException(nameof(type));
 #endif
 
-        int hash;
-        var cached = CSharpSyntaxNodeCache.TryGetNode((int)SyntaxKind.RefType, refKeyword, readOnlyKeyword, type, this.context, out hash);
-        if (cached != null) return (RefTypeSyntax)cached;
-
-        var result = new RefTypeSyntax(SyntaxKind.RefType, refKeyword, readOnlyKeyword, type, this.context);
-        if (hash >= 0)
-        {
-            SyntaxNodeCache.AddNode(result, hash);
-        }
-
-        return result;
+        return new RefTypeSyntax(SyntaxKind.RefType, refKeyword, readOnlyKeyword, lifetimeToken, type, this.context);
     }
 
     public ScopedTypeSyntax ScopedType(SyntaxToken scopedKeyword, TypeSyntax type)
@@ -28770,7 +28788,8 @@ internal partial class ContextAwareSyntax
         {
             case SyntaxKind.PostIncrementExpression:
             case SyntaxKind.PostDecrementExpression:
-            case SyntaxKind.SuppressNullableWarningExpression: break;
+            case SyntaxKind.SuppressNullableWarningExpression:
+            case SyntaxKind.PropagateExpression: break;
             default: throw new ArgumentException(nameof(kind));
         }
 #if DEBUG
@@ -28780,7 +28799,8 @@ internal partial class ContextAwareSyntax
         {
             case SyntaxKind.PlusPlusToken:
             case SyntaxKind.MinusMinusToken:
-            case SyntaxKind.ExclamationToken: break;
+            case SyntaxKind.ExclamationToken:
+            case SyntaxKind.QuestionToken: break;
             default: throw new ArgumentException(nameof(operatorToken));
         }
 #endif
@@ -33968,7 +33988,7 @@ internal static partial class SyntaxFactory
         return result;
     }
 
-    public static RefTypeSyntax RefType(SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, TypeSyntax type)
+    public static RefTypeSyntax RefType(SyntaxToken refKeyword, SyntaxToken? readOnlyKeyword, SyntaxToken? lifetimeToken, TypeSyntax type)
     {
 #if DEBUG
         if (refKeyword == null) throw new ArgumentNullException(nameof(refKeyword));
@@ -33982,20 +34002,19 @@ internal static partial class SyntaxFactory
                 default: throw new ArgumentException(nameof(readOnlyKeyword));
             }
         }
+        if (lifetimeToken != null)
+        {
+            switch (lifetimeToken.Kind)
+            {
+                case SyntaxKind.LifetimeToken:
+                case SyntaxKind.None: break;
+                default: throw new ArgumentException(nameof(lifetimeToken));
+            }
+        }
         if (type == null) throw new ArgumentNullException(nameof(type));
 #endif
 
-        int hash;
-        var cached = SyntaxNodeCache.TryGetNode((int)SyntaxKind.RefType, refKeyword, readOnlyKeyword, type, out hash);
-        if (cached != null) return (RefTypeSyntax)cached;
-
-        var result = new RefTypeSyntax(SyntaxKind.RefType, refKeyword, readOnlyKeyword, type);
-        if (hash >= 0)
-        {
-            SyntaxNodeCache.AddNode(result, hash);
-        }
-
-        return result;
+        return new RefTypeSyntax(SyntaxKind.RefType, refKeyword, readOnlyKeyword, lifetimeToken, type);
     }
 
     public static ScopedTypeSyntax ScopedType(SyntaxToken scopedKeyword, TypeSyntax type)
@@ -34137,7 +34156,8 @@ internal static partial class SyntaxFactory
         {
             case SyntaxKind.PostIncrementExpression:
             case SyntaxKind.PostDecrementExpression:
-            case SyntaxKind.SuppressNullableWarningExpression: break;
+            case SyntaxKind.SuppressNullableWarningExpression:
+            case SyntaxKind.PropagateExpression: break;
             default: throw new ArgumentException(nameof(kind));
         }
 #if DEBUG
@@ -34147,7 +34167,8 @@ internal static partial class SyntaxFactory
         {
             case SyntaxKind.PlusPlusToken:
             case SyntaxKind.MinusMinusToken:
-            case SyntaxKind.ExclamationToken: break;
+            case SyntaxKind.ExclamationToken:
+            case SyntaxKind.QuestionToken: break;
             default: throw new ArgumentException(nameof(operatorToken));
         }
 #endif

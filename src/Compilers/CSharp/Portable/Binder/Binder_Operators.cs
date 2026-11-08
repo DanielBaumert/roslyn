@@ -3863,9 +3863,47 @@ namespace Microsoft.CodeAnalysis.CSharp
         }
 #nullable disable
 
+        /// <summary>
+        /// RustSharp: <c>x?</c> on a Result or Option. It binds to a call of System.Propagation.Propagate,
+        /// which the native backend turns into the branch and the early return.
+        /// </summary>
+        private BoundExpression BindPropagateExpression(PostfixUnaryExpressionSyntax node, BindingDiagnosticBag diagnostics)
+            => BindPropagate(node, BindValue(node.Operand, diagnostics, BindValueKind.RValue), diagnostics);
+
+        private BoundExpression BindPropagate(SyntaxNode node, BoundExpression operand, BindingDiagnosticBag diagnostics)
+        {
+            MethodSymbol? method = null;
+            if (operand.Type is NamedTypeSymbol { ContainingNamespace.Name: "System" } wrapper
+                && (wrapper.Name, wrapper.Arity) is ("Result", 2) or ("Option", 1)
+                && Compilation.GetTypeByMetadataName("System.Propagation") is { } helper)
+            {
+                foreach (var m in helper.GetMembers("Propagate"))
+                {
+                    if (m is MethodSymbol { Arity: var arity } candidate && arity == wrapper.Arity)
+                        method = candidate.Construct(wrapper.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics);
+                }
+            }
+
+            if (method is null)
+            {
+                Error(diagnostics, ErrorCode.ERR_OwnPropagateOperand, node, operand.Display);
+                return BadExpression(node, operand);
+            }
+
+            return BoundCall.Synthesized(node, receiverOpt: null, initialBindingReceiverIsSubjectToCloning: ThreeState.False, method, operand);
+        }
+
         private BoundExpression BindSuppressNullableWarningExpression(PostfixUnaryExpressionSyntax node, BindingDiagnosticBag diagnostics)
         {
             MessageID.IDS_FeatureNullableReferenceTypes.CheckFeatureAvailability(diagnostics, node.OperatorToken);
+
+            if (IsNullFree(node))
+            {
+                BindExpression(node.Operand, diagnostics);
+                Error(diagnostics, ErrorCode.ERR_OwnNoNullOperator, node.OperatorToken, "!",
+                    "there is no null check to silence. To get the value out of an Option<T>, call `Unwrap()` (it panics on None) or match `Some(var v)`");
+                return BadExpression(node);
+            }
 
             var expr = BindExpression(node.Operand, diagnostics);
             switch (expr.Kind)
@@ -5118,6 +5156,13 @@ namespace Microsoft.CodeAnalysis.CSharp
             AliasSymbol alias;
             TypeWithAnnotations targetTypeWithAnnotations = BindType(node.Right, diagnostics, out alias);
             TypeSymbol targetType = targetTypeWithAnnotations.Type;
+            if (IsNullFree(node))
+            {
+                // A failed `as` is null. Rust's downcast gives an Option; C#'s `is` pattern tests and binds at once.
+                Error(diagnostics, ErrorCode.ERR_OwnNoNullOperator, node.OperatorToken, "as",
+                    $"a failed cast would give null. Test and bind in one step: `if (x is {targetType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)} v)`, or switch on the type");
+                return BadExpression(node, operand);
+            }
             var typeExpression = new BoundTypeExpression(node.Right, alias, targetTypeWithAnnotations);
             var targetTypeKind = targetType.TypeKind;
             var resultType = targetType;
@@ -5406,6 +5451,14 @@ namespace Microsoft.CodeAnalysis.CSharp
 
         private BoundExpression BindNullCoalescingOperator(BinaryExpressionSyntax node, BindingDiagnosticBag diagnostics)
         {
+            if (IsNullFree(node))
+            {
+                BindValue(node.Left, diagnostics, BindValueKind.RValue);
+                BindValue(node.Right, diagnostics, BindValueKind.RValue);
+                Error(diagnostics, ErrorCode.ERR_OwnNoNullOperator, node.OperatorToken, "??",
+                    "a value that may be missing is an Option<T>: write `o.UnwrapOr(x)`, `o.UnwrapOrElse(() => x)`, or `o.Or(other)`");
+                return BadExpression(node);
+            }
             var leftOperand = BindValue(node.Left, diagnostics, BindValueKind.RValue);
             leftOperand = BindToNaturalType(leftOperand, diagnostics);
             var rightOperand = BindValue(node.Right, diagnostics, BindValueKind.RValue);
@@ -5594,6 +5647,14 @@ namespace Microsoft.CodeAnalysis.CSharp
         private BoundExpression BindNullCoalescingAssignmentOperator(AssignmentExpressionSyntax node, BindingDiagnosticBag diagnostics)
         {
             MessageID.IDS_FeatureCoalesceAssignmentExpression.CheckFeatureAvailability(diagnostics, node.OperatorToken);
+            if (IsNullFree(node))
+            {
+                BindValue(node.Left, diagnostics, BindValueKind.RValue);
+                BindValue(node.Right, diagnostics, BindValueKind.RValue);
+                Error(diagnostics, ErrorCode.ERR_OwnNoNullOperator, node.OperatorToken, "??=",
+                    "a value that may be missing is an Option<T>: write `o.GetOrInsert(x)`, or `o.GetOrInsertWith(() => x)`");
+                return BadExpression(node);
+            }
 
             BoundExpression leftOperand = BindValue(node.Left, diagnostics, BindValueKind.CompoundAssignment);
             ReportSuppressionIfNeeded(leftOperand, diagnostics);

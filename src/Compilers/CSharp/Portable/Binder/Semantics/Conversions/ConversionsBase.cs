@@ -1509,6 +1509,14 @@ namespace Microsoft.CodeAnalysis.CSharp
 
                 for (int p = 0; p < delegateParameters.Length; ++p)
                 {
+                    // RustSharp: an untyped parameter borrows when the delegate says so: `x => x.V > 1`.
+                    if (!anonymousFunction.HasExplicitlyTypedParameterList && delegateParameters[p].RefKind == RefKind.In
+                        && anonymousFunction.RefKind(p) == RefKind.None
+                        && ((CSharpParseOptions?)anonymousFunction.Syntax.SyntaxTree.Options)?.IsOwnershipEnabled == true)
+                    {
+                        continue;
+                    }
+
                     if (!OverloadResolution.AreRefsCompatibleForMethodConversion(
                             candidateMethodParameterRefKind: anonymousFunction.RefKind(p),
                             delegateParameterRefKind: delegateParameters[p].RefKind,

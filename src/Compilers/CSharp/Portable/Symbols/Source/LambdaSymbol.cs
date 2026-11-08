@@ -347,6 +347,13 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
             for (int p = 0; p < unboundLambda.ParameterCount; ++p)
             {
                 var refKind = unboundLambda.RefKind(p);
+                if (((CSharpParseOptions?)unboundLambda.Syntax.SyntaxTree.Options)?.IsOwnershipEnabled == true
+                    && refKind == RefKind.None && p < parameterRefKinds.Length && parameterRefKinds[p] == RefKind.In
+                    && !unboundLambda.HasExplicitlyTypedParameterList)
+                {
+                    refKind = RefKind.In; // RustSharp: see IsAnonymousFunctionCompatibleWithDelegate.
+                }
+
                 var scope = unboundLambda.DeclaredScope(p);
                 var paramSyntax = unboundLambda.ParameterSyntax(p);
 

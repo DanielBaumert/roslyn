@@ -412,6 +412,12 @@
         <summary>Gets the optional "readonly" keyword.</summary>
       </PropertyComment>
     </Field>
+    <Field Name="LifetimeToken" Type="SyntaxToken" Optional="true">
+      <Kind Name="LifetimeToken"/>
+      <PropertyComment>
+        <summary>RustSharp: gets the optional lifetime, e.g. 'a.</summary>
+      </PropertyComment>
+    </Field>
     <Field Name="Type" Type="TypeSyntax"/>
   </Node>
   <Node Name="ScopedTypeSyntax" Base="TypeSyntax">
@@ -543,6 +549,7 @@
     <Kind Name="PostIncrementExpression"/>
     <Kind Name="PostDecrementExpression"/>
     <Kind Name="SuppressNullableWarningExpression"/>
+    <Kind Name="PropagateExpression"/>
     <Field Name="Operand" Type="ExpressionSyntax">
       <PropertyComment>
         <summary>ExpressionSyntax representing the operand of the postfix unary expression.</summary>
@@ -552,6 +559,7 @@
       <Kind Name="PlusPlusToken"/>
       <Kind Name="MinusMinusToken"/>
       <Kind Name="ExclamationToken"/>
+      <Kind Name="QuestionToken"/>
       <PropertyComment>
         <summary>SyntaxToken representing the kind of the operator of the postfix unary expression.</summary>
       </PropertyComment>

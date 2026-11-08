@@ -65,7 +65,7 @@ namespace Microsoft.CodeAnalysis.CSharp.UnitTests
             => InternalSyntaxFactory.OmittedTypeArgument(InternalSyntaxFactory.Token(SyntaxKind.OmittedTypeArgumentToken));
 
         private static Syntax.InternalSyntax.RefTypeSyntax GenerateRefType()
-            => InternalSyntaxFactory.RefType(InternalSyntaxFactory.Token(SyntaxKind.RefKeyword), null, GenerateIdentifierName());
+            => InternalSyntaxFactory.RefType(InternalSyntaxFactory.Token(SyntaxKind.RefKeyword), null, null, GenerateIdentifierName());
 
         private static Syntax.InternalSyntax.ScopedTypeSyntax GenerateScopedType()
             => InternalSyntaxFactory.ScopedType(InternalSyntaxFactory.Token(SyntaxKind.ScopedKeyword), GenerateIdentifierName());
@@ -963,6 +963,7 @@ namespace Microsoft.CodeAnalysis.CSharp.UnitTests
 
             Assert.Equal(SyntaxKind.RefKeyword, node.RefKeyword.Kind);
             Assert.Null(node.ReadOnlyKeyword);
+            Assert.Null(node.LifetimeToken);
             Assert.NotNull(node.Type);
 
             AttachAndCheckDiagnostics(node);
@@ -10415,7 +10416,7 @@ namespace Microsoft.CodeAnalysis.CSharp.UnitTests
             => SyntaxFactory.OmittedTypeArgument(SyntaxFactory.Token(SyntaxKind.OmittedTypeArgumentToken));
 
         private static RefTypeSyntax GenerateRefType()
-            => SyntaxFactory.RefType(SyntaxFactory.Token(SyntaxKind.RefKeyword), default(SyntaxToken), GenerateIdentifierName());
+            => SyntaxFactory.RefType(SyntaxFactory.Token(SyntaxKind.RefKeyword), default(SyntaxToken), default(SyntaxToken), GenerateIdentifierName());
 
         private static ScopedTypeSyntax GenerateScopedType()
             => SyntaxFactory.ScopedType(SyntaxFactory.Token(SyntaxKind.ScopedKeyword), GenerateIdentifierName());
@@ -11313,8 +11314,9 @@ namespace Microsoft.CodeAnalysis.CSharp.UnitTests
 
             Assert.Equal(SyntaxKind.RefKeyword, node.RefKeyword.Kind());
             Assert.Equal(SyntaxKind.None, node.ReadOnlyKeyword.Kind());
+            Assert.Equal(SyntaxKind.None, node.LifetimeToken.Kind());
             Assert.NotNull(node.Type);
-            var newNode = node.WithRefKeyword(node.RefKeyword).WithReadOnlyKeyword(node.ReadOnlyKeyword).WithType(node.Type);
+            var newNode = node.WithRefKeyword(node.RefKeyword).WithReadOnlyKeyword(node.ReadOnlyKeyword).WithLifetimeToken(node.LifetimeToken).WithType(node.Type);
             Assert.Equal(node, newNode);
         }
 

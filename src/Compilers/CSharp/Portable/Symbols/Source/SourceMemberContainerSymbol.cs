@@ -4582,7 +4582,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
                         case MethodKind.UserDefinedOperator:
                             break;
                         case MethodKind.Destructor:
-                            diagnostics.Add(ErrorCode.ERR_OnlyClassesCanContainDestructors, member.GetFirstLocation());
+                            if (((CSharpParseOptions?)member.GetFirstLocation().SourceTree?.Options)?.IsOwnershipEnabled != true)
+                            {
+                                diagnostics.Add(ErrorCode.ERR_OnlyClassesCanContainDestructors, member.GetFirstLocation());
+                            }
                             break;
                         case MethodKind.ExplicitInterfaceImplementation:
                         //CS0541 is handled in SourcePropertySymbol

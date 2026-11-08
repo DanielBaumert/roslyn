@@ -16,6 +16,9 @@ namespace Microsoft.CodeAnalysis.CSharp
     /// </summary>
     public sealed class CSharpParseOptions : ParseOptions, IEquatable<CSharpParseOptions>
     {
+        /// <summary>RustSharp: true when the Rust-style ownership dialect is enabled (feature flag "ownership").</summary>
+        internal bool IsOwnershipEnabled => Features.ContainsKey("ownership");
+
         /// <summary>
         /// The default parse options.
         /// </summary>

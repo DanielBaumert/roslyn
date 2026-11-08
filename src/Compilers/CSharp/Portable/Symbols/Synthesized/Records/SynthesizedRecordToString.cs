@@ -49,6 +49,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
         internal override void GenerateMethodBody(TypeCompilationState compilationState, BindingDiagnosticBag diagnostics)
         {
             var F = new SyntheticBoundNodeFactory(this, this.SyntaxNode, compilationState, diagnostics);
+            if (this.SyntaxNode.SyntaxTree.Options is CSharpParseOptions { IsOwnershipEnabled: true })
+            {
+                // RustSharp: the native backend derives ToString (Rust's Debug); this body is never compiled.
+                F.CloseMethod(F.Return(F.StringLiteral("")));
+                return;
+            }
 
             try
             {

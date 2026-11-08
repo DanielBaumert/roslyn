@@ -549,6 +549,13 @@ namespace Microsoft.CodeAnalysis.CSharp
 
                 TypeSyntax typeArgumentSyntax = nullableSyntax.ElementType;
                 TypeWithAnnotations typeArgument = BindType(typeArgumentSyntax, diagnostics, basesBeingResolved);
+
+                // RustSharp: there is no null. `T?` is only a short way to write Option<T>, for classes and structs alike.
+                if (IsNullFree(nullableSyntax) && Compilation.GetTypeByMetadataName("System.Option`1") is { } option)
+                {
+                    return TypeWithAnnotations.Create(option.Construct(ImmutableArray.Create(typeArgument)));
+                }
+
                 TypeWithAnnotations constructedType = typeArgument.SetIsAnnotated(Compilation);
 
                 reportNullableReferenceTypesIfNeeded(nullableSyntax.QuestionToken, typeArgument);
@@ -892,7 +899,14 @@ namespace Microsoft.CodeAnalysis.CSharp
             {
                 if (node.Identifier.ValueText == "dynamic")
                 {
-                    if (dynamicAllowed())
+                    if (((CSharpParseOptions)node.SyntaxTree.Options).IsOwnershipEnabled)
+                    {
+                        // RustSharp: Rust has no late binding. An interface is `dyn Trait`, and `object` with
+                        // `is` is `dyn Any`; `dynamic` would type everything at run time.
+                        Error(diagnostics, ErrorCode.ERR_OwnNoDynamic, node);
+                        bindingResult = CreateErrorType("dynamic");
+                    }
+                    else if (dynamicAllowed())
                     {
                         bindingResult = Compilation.DynamicType;
                         ReportUseSiteDiagnosticForDynamic(diagnostics, node);

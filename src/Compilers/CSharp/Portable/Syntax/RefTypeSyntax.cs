@@ -10,7 +10,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax
     {
         public RefTypeSyntax Update(SyntaxToken refKeyword, TypeSyntax type)
         {
-            return Update(refKeyword, ReadOnlyKeyword, type);
+            return Update(refKeyword, ReadOnlyKeyword, LifetimeToken, type);
         }
     }
 }
@@ -22,7 +22,7 @@ namespace Microsoft.CodeAnalysis.CSharp
         /// <summary>Creates a new RefTypeSyntax instance.</summary>
         public static RefTypeSyntax RefType(SyntaxToken refKeyword, TypeSyntax type)
         {
-            return RefType(refKeyword, readOnlyKeyword: default, type);
+            return RefType(refKeyword, readOnlyKeyword: default, lifetimeToken: default, type);
         }
     }
 }

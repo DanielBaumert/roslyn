@@ -27,6 +27,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Emit
 {
     internal abstract class PEModuleBuilder : PEModuleBuilder<CSharpCompilation, SourceModuleSymbol, AssemblySymbol, TypeSymbol, NamedTypeSymbol, MethodSymbol, SyntaxNode, NoPia.EmbeddedTypesManager, ModuleCompilationState>
     {
+        /// <summary>RustSharp: when set, lowered bodies go here instead of the IL emitter.</summary>
+        internal Ownership.LoweredBodySink? BodySink;
+
         // TODO: Need to estimate amount of elements for this map and pass that value to the constructor.
         protected readonly ConcurrentDictionary<Symbol, Cci.IModuleReference> AssemblyOrModuleSymbolToModuleRefMap = new ConcurrentDictionary<Symbol, Cci.IModuleReference>();
         private readonly ConcurrentDictionary<Symbol, object> _genericInstanceMap = new ConcurrentDictionary<Symbol, object>(Symbols.SymbolEqualityComparer.ConsiderEverything);

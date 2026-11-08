@@ -2536,6 +2536,45 @@ namespace Microsoft.CodeAnalysis.CSharp
                 or ErrorCode.ERR_MethodImplAttributeAsyncCannotBeUsed
                 or ErrorCode.ERR_AttributeCannotBeAppliedManually
                 or ErrorCode.ERR_BadSpreadInCatchFilter
+                or ErrorCode.ERR_OwnUseOfMovedValue
+                or ErrorCode.ERR_OwnBorrowOfMovedValue
+                or ErrorCode.ERR_OwnMoveOutOfBorrow
+                or ErrorCode.ERR_OwnMoveOutOfIndex
+                or ErrorCode.ERR_OwnMoveOutOfStatic
+                or ErrorCode.ERR_OwnMoveOutOfDropType
+                or ErrorCode.ERR_OwnMoveWhileBorrowed
+                or ErrorCode.ERR_OwnAssignToBorrowed
+                or ErrorCode.ERR_OwnUseWhileMutBorrowed
+                or ErrorCode.ERR_OwnMutBorrowWhileShared
+                or ErrorCode.ERR_OwnSharedBorrowWhileMut
+                or ErrorCode.ERR_OwnDoubleMutBorrow
+                or ErrorCode.ERR_OwnDoesNotLiveLongEnough
+                or ErrorCode.ERR_OwnTemporaryDropped
+                or ErrorCode.ERR_OwnReturnRefToLocal
+                or ErrorCode.ERR_OwnLifetimeMismatch
+                or ErrorCode.ERR_OwnMissingLifetimeSpecifier
+                or ErrorCode.ERR_OwnAssignThroughShared
+                or ErrorCode.ERR_OwnMutBorrowThroughShared
+                or ErrorCode.ERR_OwnOwnershipUnsupported
+                or ErrorCode.ERR_OwnReadonlyOverrideMismatch
+                or ErrorCode.ERR_OwnRequiresUnsafe
+                or ErrorCode.ERR_OwnNotClone
+                or ErrorCode.ERR_OwnNotSend
+                or ErrorCode.ERR_OwnNotSync
+                or ErrorCode.ERR_OwnClosureOutlives
+                or ErrorCode.ERR_OwnMustNotSuspend
+                or ErrorCode.ERR_OwnClosureMutates
+                or ErrorCode.ERR_OwnAssignImmutable
+                or ErrorCode.ERR_OwnBorrowImmutable
+                or ErrorCode.ERR_OwnNoExceptions
+                or ErrorCode.ERR_OwnPropagateOperand
+                or ErrorCode.ERR_OwnPropagateReturn
+                or ErrorCode.ERR_OwnNoDynamic
+                or ErrorCode.ERR_OwnNoInheritance
+                or ErrorCode.ERR_OwnNoNull
+                or ErrorCode.ERR_OwnNoNullableContext
+                or ErrorCode.ERR_OwnNoNullOperator
+                or ErrorCode.ERR_OwnNullDefault
                     => false,
             };
 #pragma warning restore CS8524 // The switch expression does not handle some values of its input type (it is not exhaustive) involving an unnamed enum value.
