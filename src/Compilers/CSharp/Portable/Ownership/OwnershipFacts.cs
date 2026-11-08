@@ -255,8 +255,11 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// </summary>
         private static bool MayCarry(MethodSymbol m, TypeSymbol t)
         {
+            // The type's own parameters, and those of its generic methods (`Some<T>(T value)`, `MapOr<U>(U
+            // fallback, ...)`): [CarriesBorrows] promises that such code only passes values on.
             if (t is TypeParameterSymbol tp)
-                return m.ContainingType is { } ct && HasAttribute(ct, "CarriesBorrowsAttribute") && ReferenceEquals(tp.ContainingSymbol, ct.OriginalDefinition);
+                return m.ContainingType is { } ct && HasAttribute(ct, "CarriesBorrowsAttribute")
+                    && (ReferenceEquals(tp.ContainingSymbol, ct.OriginalDefinition) || ReferenceEquals(tp.ContainingSymbol, m.OriginalDefinition));
             return t is NamedTypeSymbol { IsGenericType: true } n && HasAttribute(n, "CarriesBorrowsAttribute")
                 && n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics.Any(a => a.Type is TypeParameterSymbol || IsBorrowHolder(a.Type) || MayCarry(m, a.Type));
         }
