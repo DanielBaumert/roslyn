@@ -838,8 +838,6 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                     if (whole >= 0) DeclareOutlives(slots[k], whole);
                 }
             }
-            if (sig.OutputSlots is { } outNames && _localSlots[0] is { } outSlots && outSlots.Length == outNames.Length)
-                for (int k = 0; k < outSlots.Length; k++) outSlots[k] = Universal(outNames[k]);
 
             // '#data: what a ref struct or reference returns lives as long as what it points at.
             if (sig.Output == "'#data" && _b.ArgCount > 0 && _localInner[1] >= 0) returnRegion = _localInner[1];
@@ -863,6 +861,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 else if (sig.OutputFromAll)
                     foreach (var u in _universalRegions.ToList()) Outlives(u, _localRegion[0], _b.Syntax);
             }
+
+            // The result's slots: a named one is the caller's lifetime; one that is the whole result's
+            // lifetime (elided where nothing names it) is just that region.
+            if (sig.OutputSlots is { } outNames && _localSlots[0] is { } outSlots && outSlots.Length == outNames.Length)
+                for (int k = 0; k < outSlots.Length; k++)
+                    outSlots[k] = outNames[k] == OwnershipFacts.WholeResult ? (_b.Locals[0].Type.IsRef ? _localInner[0] : _localRegion[0]) : Universal(outNames[k]);
 
             foreach (var (longer, shorter) in sig.Bounds) DeclareOutlives(Universal(longer), Universal(shorter));
             CloseImplied();
@@ -1051,7 +1055,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             int destInner = c.Dest.IsLocal ? _localInner[c.Dest.Local] : -1;
 
             if (sig.OutputSlots is { } outNames && SlotsOf(c.Dest) is { } outSlots && outSlots.Length == outNames.Length)
-                for (int k = 0; k < outSlots.Length; k++) Outlives(Fresh(outNames[k]), outSlots[k], c.Syntax);
+                for (int k = 0; k < outSlots.Length; k++)
+                    Outlives(outNames[k] == OwnershipFacts.WholeResult ? (c.Dest.IsLocal && _b.Locals[c.Dest.Local].Type.IsRef ? destInner : dest) : Fresh(outNames[k]), outSlots[k], c.Syntax);
 
             // A result named after an input's slot (`ref readonly 'a int First(in Pair<'a, 'b> p)`) lives for that slot.
             if (sig.IsSlotName(sig.Output))

@@ -366,7 +366,24 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         private static readonly ConcurrentDictionary<MethodSymbol, LifetimeSig> s_sigs = new(Symbols.SymbolEqualityComparer.AllIgnoreOptions);
 
         public static LifetimeSig GetLifetimeSig(MethodSymbol method)
-            => s_sigs.GetOrAdd(method.OriginalDefinition, static m => ComputeSig(m));
+            => s_sigs.GetOrAdd(method.OriginalDefinition, static m => ElideOutputSlots(ComputeSig(m)));
+
+        /// <summary>The name of an output slot that is simply the lifetime of the whole result.</summary>
+        public const string WholeResult = "'#result";
+
+        /// <summary>
+        /// Rust's elision for lifetimes in the result's type: an elided one is the lifetime the result
+        /// comes from. Where that is not a plain lifetime ('#data, '#self, or from all inputs), the slot is
+        /// the lifetime of the whole result, which is what it was before lifetime parameters.
+        /// </summary>
+        private static LifetimeSig ElideOutputSlots(LifetimeSig sig)
+        {
+            if (sig.OutputSlots is not { } slots) return sig;
+            bool plain = sig.Output != null && !sig.Output.StartsWith("'#data", System.StringComparison.Ordinal) && sig.Output != "'#self";
+            for (int k = 0; k < slots.Length; k++)
+                if (slots[k].StartsWith("'#elided", System.StringComparison.Ordinal)) slots[k] = plain ? sig.Output : WholeResult;
+            return sig;
+        }
 
         private static string ExplicitLifetime(SyntaxTokenList mods)
         {
@@ -424,6 +441,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             }
             sig.OutputSlots = Lifetimes.Slots(m.ReturnType, (decl as MethodDeclarationSyntax)?.ReturnType, "ret");
 
+            // A value of a type with one lifetime, such as Ref<'a, T>, lives exactly as long as that
+            // lifetime: `Ref<'a, int> x` is an input named 'a, like Rust's `x: &'a i32`.
+            for (int i = first; i < sig.Inputs.Length; i++)
+                if (sig.InputSlots[i] is { Length: 1 } one && !one[0].StartsWith("'#", System.StringComparison.Ordinal) && sig.Inputs[i] == "'#" + (i - first))
+                    sig.Inputs[i] = one[0];
+
             // The parser keeps `where 'a : 'b` as skipped tokens behind the parameter list.
             if (paramList != null)
             {
@@ -470,6 +493,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             {
                 explicitOut = (md.ReturnType as RefTypeSyntax)?.LifetimeToken.ValueText;
                 if (string.IsNullOrEmpty(explicitOut)) explicitOut = ExplicitLifetime(md.Modifiers);
+                // `Ref<'a, int> Pick(...)`: a result of a type with one named lifetime lives for it.
+                if (string.IsNullOrEmpty(explicitOut) && sig.OutputSlots is { Length: 1 } one && !one[0].StartsWith("'#", System.StringComparison.Ordinal))
+                    explicitOut = one[0];
             }
 
             if (!string.IsNullOrEmpty(explicitOut))
