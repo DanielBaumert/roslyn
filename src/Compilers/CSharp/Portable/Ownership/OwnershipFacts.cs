@@ -31,6 +31,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         public string[][] InputSlots;
         /// <summary>One name per slot of the result's type, or null.</summary>
         public string[] OutputSlots;
+        /// <summary>
+        /// Inputs that are `out` or `ref` parameters which the callee fills with what it holds, such as
+        /// Option's <c>Deconstruct(out T value)</c> behind the pattern <c>Some(var v)</c>: what lands there may
+        /// come from any other input.
+        /// </summary>
+        public List<int> FilledFromInputs;
         /// <summary>Whether a name is the lifetime of some input's slot, such as <c>'a</c> in <c>First(in Pair&lt;'a, 'b&gt;)</c>.</summary>
         public bool IsSlotName(string name) => name != null && InputSlots != null && InputSlots.Any(s => s != null && System.Array.IndexOf(s, name) >= 0);
     }
@@ -482,6 +488,11 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 sig.InputSlots[first + i] = Lifetimes.Slots(m.Parameters[i].Type, typeSyntax, i.ToString());
             }
             sig.OutputSlots = Lifetimes.Slots(m.ReturnType, returnSyntax, "ret");
+
+            // A container's generic code is trusted, not checked: an `out T` it fills carries its content.
+            for (int i = 0; i < m.ParameterCount; i++)
+                if (m.Parameters[i].RefKind is RefKind.Out or RefKind.Ref && MayCarry(m, m.Parameters[i].Type))
+                    (sig.FilledFromInputs ??= new List<int>()).Add(first + i);
 
             // A value of a type with one lifetime, such as Ref<'a, T>, lives exactly as long as that
             // lifetime: `Ref<'a, int> x` is an input named 'a, like Rust's `x: &'a i32`.

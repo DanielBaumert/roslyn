@@ -1107,6 +1107,21 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 }
             }
 
+            // `Some(var v)` through Deconstruct(out T value): what the callee writes may come from any input.
+            if (sig.FilledFromInputs is { } filled)
+                foreach (int i in filled)
+                {
+                    if (i >= c.Args.Count) continue;
+                    int target = InnerOf(c.Args[i]);
+                    if (target < 0) continue;
+                    for (int j = 0; j < c.Args.Count; j++)
+                    {
+                        if (j == i) continue;
+                        Outlives(RegionOf(c.Args[j]), target, c.Syntax);
+                        Outlives(InnerOf(c.Args[j]), target, c.Syntax);
+                    }
+                }
+
             if (c.Dest is null) return;
             int dest = RegionOf(c.Dest);
             int destInner = c.Dest.IsLocal ? _localInner[c.Dest.Local] : -1;
