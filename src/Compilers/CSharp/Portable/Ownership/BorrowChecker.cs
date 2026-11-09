@@ -711,6 +711,19 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
 
         private int[] SlotsOf(Operand op) => SlotsOf(op is CopyOp c ? c.Place : op is MoveOp m ? m.Place : null);
 
+        /// <summary>Whether a place is reached by dereferencing a raw pointer, which unsafe code answers for.</summary>
+        private bool ThroughRawPointer(Place p)
+        {
+            if (p.Static is not null) return false;
+            var t = BaseType(p);
+            foreach (var proj in p.Projs)
+            {
+                if (proj is DerefProj && !t.IsRef && t.Type is PointerTypeSymbol) return true;
+                t = MirBody.Project(t, proj);
+            }
+            return false;
+        }
+
         /// <summary>Whether a type parameter belongs to the method being checked or to a type around it.</summary>
         private bool OwnsTypeParameter(TypeParameterSymbol tp)
         {
@@ -742,6 +755,16 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         {
             _regions.Add(new Bits(_points + 64));
             return _regions.Count - 1;
+        }
+
+        /// <summary>
+        /// A value moves from slot <paramref name="from"/> to slot <paramref name="to"/>: as Rust's variance has it,
+        /// covariant may shorten, contravariant may lengthen, invariant must stay the same.
+        /// </summary>
+        private void Relate(int from, int to, Variance v, SyntaxNode syntax)
+        {
+            if (v is Variance.Covariant or Variance.Invariant) Outlives(from, to, syntax);
+            if (v is Variance.Contravariant or Variance.Invariant) Outlives(to, from, syntax);
         }
 
         private void Outlives(int sup, int sub, SyntaxNode syntax)
@@ -798,7 +821,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (src.IsLocal && dest.IsLocal) Outlives(_localInner[src.Local], _localInner[dest.Local], syntax);
             // Slot by slot: a value may move to where its lifetimes are shorter (covariance).
             if (SlotsOf(src) is { } from && SlotsOf(dest) is { } to && from.Length == to.Length)
-                for (int k = 0; k < from.Length; k++) Outlives(from[k], to[k], syntax);
+                for (int k = 0; k < from.Length; k++) Relate(from[k], to[k], Lifetimes.VarianceOf(_b.TypeOf(src).Type, k), syntax);
         }
 
         /// <summary>
@@ -885,7 +908,17 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 int local = i + 1;
                 if (_localRegion[local] < 0) continue;
                 string name = sig.Inputs[i] ?? "'#anon" + i;
-                if (_localInner[local] >= 0)
+                if (_localInner[local] >= 0 && sig.NamesBorrow?[i] == true)
+                {
+                    // `ref 'a T t`: as in Rust, 'a is the borrow; what it points at lives for T's own lifetime.
+                    int outer = Universal(name);
+                    int inner = Universal(sig.Held?[i] ?? "'#inner" + local);
+                    _localInner[local] = inner;
+                    _localRegion[local] = outer;
+                    _implied.Add((inner, outer));
+                    Outlives(inner, outer, _b.Syntax);
+                }
+                else if (_localInner[local] >= 0)
                 {
                     // `&'outer mut View<'name>`: the name is the data, and the data outlives the reference.
                     int inner = Universal(name);
@@ -1018,8 +1051,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                             if (SlotsOf(r.Place) is { } from && SlotsOf(a.Dest) is { } to && from.Length == to.Length)
                                 for (int k = 0; k < from.Length; k++)
                                 {
-                                    Outlives(from[k], to[k], a.Syntax);
-                                    if (r.Mode == RefMode.Mut) Outlives(to[k], from[k], a.Syntax);
+                                    Relate(from[k], to[k], r.Mode == RefMode.Mut ? Variance.Invariant : Lifetimes.VarianceOf(_b.TypeOf(r.Place).Type, k), a.Syntax);
                                 }
                             // A value kept where no region tracks it (a captured variable in a closure's
                             // environment, a field of an object without lifetimes) had to be 'static to get
@@ -1044,9 +1076,11 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                         {
                             foreach (var op in Operands(a.Value)) Flow(op, a.Dest, a.Syntax);
                         }
-                        else if (a.Value is not LinkRv)
+                        else if (a.Value is not LinkRv && !ThroughRawPointer(a.Dest))
                         {
                             // A place without a region (a field of an object, a static) outlives any scope.
+                            // Not behind a raw pointer: in unsafe code, borrows through raw pointers are not
+                            // checked, as with Rust's `*cell.get() = x`; the code that wrote it answers for it.
                             foreach (var op in Operands(a.Value)) RequireStatic(op, a.Syntax);
                         }
                     }
@@ -1122,7 +1156,17 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 if (arg < 0) continue;
                 int f = Fresh(name);
                 int inner = InnerOf(c.Args[i]);
-                if (inner >= 0)
+                if (inner >= 0 && sig.NamesBorrow?[i] == true)
+                {
+                    // `ref 'a T t`: the name is the borrow; the data is bound through T's lifetime below.
+                    Outlives(arg, f, c.Syntax);
+                    if (sig.Held?[i] is { } dataName)
+                    {
+                        Outlives(inner, Fresh(dataName), c.Syntax);
+                        if (c.Args[i] is MoveOp) Outlives(Fresh(dataName), inner, c.Syntax);
+                    }
+                }
+                else if (inner >= 0)
                 {
                     // The signature names the data behind `ref View`; the callee may store into it.
                     Outlives(inner, f, c.Syntax);
@@ -1140,7 +1184,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             // its slots too: T may stand for a Pair<'a, 'b>, and the callee only knows 'T.
             for (int i = 0; i < c.Args.Count && i < sig.Inputs.Length; i++)
             {
-                if (sig.Inputs[i] is not { } tname || !tname.StartsWith("'#T:", StringComparison.Ordinal) || SlotsOf(c.Args[i]) is not { } held) continue;
+                if (sig.Held?[i] is not { } tname || SlotsOf(c.Args[i]) is not { } held) continue;
                 var heldPlace = c.Args[i] is CopyOp hc ? hc.Place : ((MoveOp)c.Args[i]).Place;
                 bool storesInto = _b.TypeOf(heldPlace).Ref == RefMode.Mut;
                 foreach (var slot in held)
@@ -1180,8 +1224,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 bool invariant = _b.TypeOf(argPlace).Ref == RefMode.Mut;
                 for (int k = 0; k < slots.Length; k++)
                 {
-                    Outlives(slots[k], Fresh(names[k]), c.Syntax);
-                    if (invariant) Outlives(Fresh(names[k]), slots[k], c.Syntax);
+                    Relate(slots[k], Fresh(names[k]), invariant ? Variance.Invariant : Lifetimes.VarianceOf(_b.TypeOf(argPlace).Type, k), c.Syntax);
                 }
             }
 
@@ -1206,7 +1249,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
 
             if (sig.OutputSlots is { } outNames && SlotsOf(c.Dest) is { } outSlots && outSlots.Length == outNames.Length)
                 for (int k = 0; k < outSlots.Length; k++)
-                    Outlives(outNames[k] == OwnershipFacts.WholeResult ? (c.Dest.IsLocal && _b.Locals[c.Dest.Local].Type.IsRef ? destInner : dest) : Fresh(outNames[k]), outSlots[k], c.Syntax);
+                    Relate(outNames[k] == OwnershipFacts.WholeResult ? (c.Dest.IsLocal && _b.Locals[c.Dest.Local].Type.IsRef ? destInner : dest) : Fresh(outNames[k]),
+                        outSlots[k], Lifetimes.VarianceOf(_b.TypeOf(c.Dest).Type, k), c.Syntax);
 
             // A result the callee sees as a type parameter brings no region of its own beyond 'T.
             if (sig.Output is { } outT && outT.StartsWith("'#T:", StringComparison.Ordinal) && SlotsOf(c.Dest) is { } resultSlots)
@@ -1446,7 +1490,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             {
                 foreach (var (otherName, other) in _universal)
                 {
-                    if (region == other || _implied.Contains((region, other))) continue;
+                    // 'static outlives every lifetime.
+                    if (region == other || _implied.Contains((region, other)) || name == "'static") continue;
                     int bit = _universalRegions.IndexOf(other);
                     if (bit >= 64 || !_regions[region][_points + bit]) continue;
                     var syntax = Blame(region, other) ?? _b.Syntax;

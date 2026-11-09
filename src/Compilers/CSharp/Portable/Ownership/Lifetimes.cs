@@ -18,6 +18,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
     /// the arity of its type parameters alone. This class reads them back from the syntax for the
     /// borrow checker, which gives a value of such a type one region per declared lifetime (a slot).
     /// </summary>
+    /// <summary>Rust's variance of a type in one of its lifetimes.</summary>
+    internal enum Variance { Bivariant, Covariant, Contravariant, Invariant }
+
     internal static class Lifetimes
     {
         private static readonly ConcurrentDictionary<TypeSymbol, ImmutableArray<string>> s_declared = new(Symbols.SymbolEqualityComparer.AllIgnoreOptions);
@@ -39,7 +42,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 // the type holds as that parameter, as Rust's Vec<&'a T> carries 'a in its T.
                 // A nested type (an enum's variant) also holds its containing types' parameters.
                 foreach (var tp in AllTypeParameters((NamedTypeSymbol)def))
-                    if (OwnershipFacts.IsParametric(tp)) names.Add(OwnershipFacts.TypeParameterLifetime(tp));
+                    if (OwnershipFacts.HasSlot(tp)) names.Add(OwnershipFacts.TypeParameterLifetime(tp));
                 return names.ToImmutableArray();
             });
         }
@@ -84,6 +87,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// </summary>
         public static string TypeArgumentLifetime(TypeSymbol argument, TypeSyntax syntax)
         {
+            if (argument is TypeParameterSymbol slotted && OwnershipFacts.HasSlot(slotted)) return OwnershipFacts.TypeParameterLifetime(slotted);
             var parametric = OwnershipFacts.ParametricIn(argument);
             if (parametric.Count == 1) return OwnershipFacts.TypeParameterLifetime(parametric[0]);
             if (parametric.Count > 1) return null;
@@ -158,7 +162,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 // Only parametric parameters have a slot: find the argument for slot k.
                 int i = -1;
                 for (int seen = writtenCount - 1, j = 0; j < all.Count; j++)
-                    if (OwnershipFacts.IsParametric(all[j]) && ++seen == k) { i = j; break; }
+                    if (OwnershipFacts.HasSlot(all[j]) && ++seen == k) { i = j; break; }
                 int own = i - (all.Count - ((NamedTypeSymbol)type).Arity);
                 string name = i >= 0 && i < args.Count ? TypeArgumentLifetime(args[i], syntax is null || own < 0 ? null : TypeArgumentSyntax(syntax, own)) : null;
                 slots[k] = name ?? "'#elided" + position + "." + k;
@@ -279,6 +283,123 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             }
             return bounds;
         }
+
+        private static readonly ConcurrentDictionary<(TypeSymbol, int), Variance> s_variance = new();
+
+        /// <summary>
+        /// The variance of a type in its slot <paramref name="slot"/>, as Rust derives it from the fields:
+        /// `Ref&lt;'a, T&gt;` is covariant in both, `RefMut&lt;'a, T&gt;` invariant in T, a raw pointer, an UnsafeCell,
+        /// a delegate or an interface invariant in what it mentions, a [CarriesBorrows] collection covariant
+        /// (it changes its elements only through `&amp;mut`, like Vec over NonNull). A slot no field uses is
+        /// covariant (Rust would ask for a PhantomData).
+        /// </summary>
+        public static Variance VarianceOf(TypeSymbol type, int slot)
+        {
+            if (type is not NamedTypeSymbol n) return Variance.Covariant;
+            var def = n.OriginalDefinition;
+            if (OwnershipFacts.IsReference(def))
+                return def.Name == "RefMut" && slot >= WrittenCount(def) ? Variance.Invariant : Variance.Covariant;
+            var names = Declared(def);
+            if (slot < 0 || slot >= names.Length) return Variance.Covariant;
+            var key = ((TypeSymbol)def, slot);
+            if (s_variance.TryGetValue(key, out var known)) return known == Variance.Bivariant ? Variance.Covariant : known;
+            // Recursive types (an enum's variants) reach a fixpoint: start unused, recompute until stable.
+            s_variance[key] = Variance.Bivariant;
+            while (true)
+            {
+                var v = Variance.Bivariant;
+                foreach (var field in InstanceFieldsOf(def))
+                    v = Join(v, FieldVariance(field, names[slot]));
+                if (v == s_variance[key]) break;
+                s_variance[key] = v;
+            }
+            var result = s_variance[key];
+            return result == Variance.Bivariant ? Variance.Covariant : result;
+        }
+
+        private static IEnumerable<FieldSymbol> InstanceFieldsOf(NamedTypeSymbol def)
+        {
+            foreach (var f in def.GetMembers().OfType<FieldSymbol>()) if (!f.IsStatic) yield return f;
+            // An enum's variants are nested types that hold the parent's parameters.
+            foreach (var nested in def.GetTypeMembers())
+                foreach (var f in nested.GetMembers().OfType<FieldSymbol>()) if (!f.IsStatic) yield return f;
+        }
+
+        private static Variance FieldVariance(FieldSymbol field, string target)
+        {
+            var syntax = FieldTypeSyntax(field);
+            var type = field.OriginalDefinition.Type;
+            string own = syntax is RefTypeSyntax r && r.LifetimeToken.ValueText is { Length: > 0 } t ? t : null;
+            var inner = syntax is RefTypeSyntax rt ? rt.Type : syntax;
+            switch (field.RefKind)
+            {
+                case RefKind.Ref:
+                    return Join(own == target ? Variance.Covariant : Variance.Bivariant, Compose(Variance.Invariant, VarianceIn(type, inner, target)));
+                case RefKind.RefReadOnly or RefKind.RefReadOnlyParameter:
+                    return Join(own == target ? Variance.Covariant : Variance.Bivariant, VarianceIn(type, inner, target));
+                default:
+                    return VarianceIn(type, syntax, target);
+            }
+        }
+
+        /// <summary>How a type uses the lifetime <paramref name="target"/> (a written 'a or a type parameter's 'T).</summary>
+        private static Variance VarianceIn(TypeSymbol type, TypeSyntax syntax, string target)
+        {
+            switch (type)
+            {
+                case TypeParameterSymbol tp:
+                    return OwnershipFacts.IsParametric(tp) && OwnershipFacts.TypeParameterLifetime(tp) == target ? Variance.Covariant : Variance.Bivariant;
+                case PointerTypeSymbol p:
+                    return Compose(Variance.Invariant, VarianceIn(p.PointedAtType, null, target));
+                case ArrayTypeSymbol a:
+                    return VarianceIn(a.ElementType, null, target);
+                case NamedTypeSymbol m:
+                {
+                    var args = AllTypeArguments(m);
+                    // dyn Trait<T> and dyn Fn: invariant in what they mention.
+                    if (m.TypeKind is TypeKind.Delegate or TypeKind.Interface || IsUnsafeCell(m))
+                        return args.Any(x => VarianceIn(x, null, target) != Variance.Bivariant) ? Variance.Invariant : Variance.Bivariant;
+                    var slots = Slots(m, syntax, "variance");
+                    if (slots is not null)
+                    {
+                        var v = Variance.Bivariant;
+                        for (int k = 0; k < slots.Length; k++)
+                            if (slots[k] == target) v = Join(v, VarianceOf(m, k));
+                        // An argument may hold the lifetime in a way the slot names cannot say (`List<Ref<'a, int>>`).
+                        for (int k = 0; k < args.Count; k++)
+                        {
+                            var nested = VarianceIn(args[k], syntax is null ? null : TypeArgumentSyntax(syntax, k), target);
+                            if (nested != Variance.Bivariant) v = Join(v, Compose(VarianceOf(m, WrittenCount(m) + k), nested));
+                        }
+                        return v;
+                    }
+                    // A core-library type without slots: a [CarriesBorrows] collection is covariant in its
+                    // elements; anything else is invariant in what it mentions, to be safe.
+                    var carried = Variance.Bivariant;
+                    for (int k = 0; k < args.Count; k++)
+                        carried = Join(carried, VarianceIn(args[k], syntax is null ? null : TypeArgumentSyntax(syntax, k), target));
+                    if (carried == Variance.Bivariant) return carried;
+                    return OwnershipFacts.HasAttribute(m, "CarriesBorrowsAttribute") ? carried : Variance.Invariant;
+                }
+                default:
+                    return Variance.Bivariant;
+            }
+        }
+
+        private static bool IsUnsafeCell(NamedTypeSymbol m)
+            => m.Name == "UnsafeCell" && m.Arity == 1 && m.ContainingNamespace is { Name: "System", ContainingNamespace.IsGlobalNamespace: true };
+
+        private static Variance Join(Variance a, Variance b)
+            => a == Variance.Bivariant ? b : b == Variance.Bivariant ? a : a == b ? a : Variance.Invariant;
+
+        private static Variance Compose(Variance outer, Variance inner) => (outer, inner) switch
+        {
+            (_, Variance.Bivariant) or (Variance.Bivariant, _) => Variance.Bivariant,
+            (Variance.Covariant, _) => inner,
+            (Variance.Contravariant, Variance.Covariant) => Variance.Contravariant,
+            (Variance.Contravariant, Variance.Contravariant) => Variance.Covariant,
+            _ => Variance.Invariant,
+        };
 
         private static List<string> InTrivia(SyntaxTriviaList trivia)
         {

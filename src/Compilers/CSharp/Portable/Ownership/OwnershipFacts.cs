@@ -32,6 +32,17 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// <summary>One name per slot of the result's type, or null.</summary>
         public string[] OutputSlots;
         /// <summary>
+        /// Per input, the lifetime of the one type parameter its type holds (`'#T:Stack.T` for `T x`), or
+        /// null. For Ref and RefMut this differs from the input's own name, which is the borrow ('a).
+        /// </summary>
+        public string[] Held;
+        /// <summary>
+        /// Inputs whose written lifetime names the borrow, as Rust's `&amp;'a mut T` does: a reference to a value
+        /// whose own lifetimes the type spells out (a type parameter's 'T, a type with lifetime parameters).
+        /// For a reference to an older ref struct without them, the name is that struct's data instead.
+        /// </summary>
+        public bool[] NamesBorrow;
+        /// <summary>
         /// Inputs that are `out` or `ref` parameters which the callee fills with what it holds, such as
         /// Option's <c>Deconstruct(out T value)</c> behind the pattern <c>Some(var v)</c>: what lands there may
         /// come from any other input.
@@ -264,6 +275,17 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         public static bool CarriesBorrowsOrSlots(TypeSymbol t)
             => CarriesBorrows(t) || HasLifetimeParameters(t) || (t is NamedTypeSymbol n && n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics.Any(a => IsBorrowHolder(a.Type) || CarriesBorrowsOrSlots(a.Type)));
 
+        /// <summary>
+        /// Whether a type parameter has a slot of its own in its type: a parametric one, or the T of Ref and
+        /// RefMut, Rust's &amp;'a T and &amp;'a mut T. Their bodies stay as they are; only the slot is new.
+        /// </summary>
+        public static bool HasSlot(TypeParameterSymbol tp)
+            => IsParametric(tp) || (tp.ContainingSymbol is NamedTypeSymbol owner && IsReference(owner));
+
+        /// <summary>Whether a type's own lifetimes are spelled out: a type parameter with a slot, or a type with slots.</summary>
+        public static bool LifetimesSpelledOut(TypeSymbol t)
+            => t is TypeParameterSymbol tp ? HasSlot(tp) : !Lifetimes.Declared(t).IsEmpty;
+
         /// <summary>The lifetime a parametric type parameter carries, as named in signatures: `'#T:Stack.T`.</summary>
         public static string TypeParameterLifetime(TypeParameterSymbol tp) => "'#T:" + tp.ContainingSymbol.Name + "." + tp.Name;
 
@@ -492,6 +514,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         private static LifetimeSig ComputeSig(MethodSymbol m)
         {
             var inputs = new List<string>();
+            var heldLifetimes = new List<string>();
+            var namesBorrow = new List<bool>();
+            bool referenceType = IsReference(m.ContainingType);
             var scoped = new List<bool>();
             var decl = m.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax();
             var paramList = (decl as BaseMethodDeclarationSyntax)?.ParameterList ?? (decl as DelegateDeclarationSyntax)?.ParameterList;
@@ -502,6 +527,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (!m.IsStatic)
             {
                 inputs.Add(thisBorrows || IsBorrowHolder(m.ContainingType) || MayCarry(m, m.ContainingType) ? "'#this" : null);
+                heldLifetimes.Add(null);
+                namesBorrow.Add(false);
                 scoped.Add(false);
             }
 
@@ -516,6 +543,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 if (container && p.RefKind == RefKind.None && !IsBorrowHolder(p.Type) && MayCarry(m, p.Type))
                 {
                     inputs.Add("'#self");
+                    heldLifetimes.Add(null);
+                namesBorrow.Add(false);
                     scoped.Add(false);
                     continue;
                 }
@@ -525,12 +554,17 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 // A parameter that carries one of the method's own type parameters lives for its lifetime 'T.
                 var parametric = ParametricIn(p.Type);
                 if (parametric.Count > 0) borrow = true;
-                if (name is null && parametric.Count == 1) name = TypeParameterLifetime(parametric[0]);
+                namesBorrow.Add(name is not null && p.RefKind != RefKind.None && LifetimesSpelledOut(p.Type));
+                heldLifetimes.Add(parametric.Count == 1 ? TypeParameterLifetime(parametric[0])
+                    : referenceType && p.Type is TypeParameterSymbol ownT && HasSlot(ownT) ? TypeParameterLifetime(ownT) : null);
+                // Ref and RefMut are the references themselves: their parameters name the borrow ('a), and what
+                // T holds lives in T's slot, as in Rust's &'a T.
+                if (name is null && parametric.Count == 1 && !referenceType) name = TypeParameterLifetime(parametric[0]);
                 inputs.Add(borrow ? name ?? "'#" + i : null);
                 scoped.Add(p.EffectiveScope != ScopedKind.None);
             }
 
-            var sig = new LifetimeSig { Inputs = inputs.ToArray() };
+            var sig = new LifetimeSig { Inputs = inputs.ToArray(), Held = heldLifetimes.ToArray(), NamesBorrow = namesBorrow.ToArray() };
 
             // Lifetime parameters of the inputs' and the result's types, one name per slot.
             sig.InputSlots = new string[sig.Inputs.Length][];
@@ -551,7 +585,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             // A value of a type with one lifetime, such as Ref<'a, T>, lives exactly as long as that
             // lifetime: `Ref<'a, int> x` is an input named 'a, like Rust's `x: &'a i32`.
             for (int i = first; i < sig.Inputs.Length; i++)
-                if (sig.InputSlots[i] is { Length: 1 } one && !one[0].StartsWith("'#", System.StringComparison.Ordinal) && sig.Inputs[i] == "'#" + (i - first))
+                if (sig.InputSlots[i] is { Length: > 0 } one && Lifetimes.WrittenCount(m.Parameters[i - first].Type) == 1
+                    && !one[0].StartsWith("'#", System.StringComparison.Ordinal) && sig.Inputs[i] == "'#" + (i - first))
                     sig.Inputs[i] = one[0];
 
             // The parser keeps `where 'a : 'b` and `where T : 'a` as skipped tokens behind the parameter list.
@@ -568,6 +603,13 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                         }
                 for (int i = 0; i + 1 < names.Count; i += 2) sig.Bounds.Add((names[i], names[i + 1]));
             }
+
+            // Rust's well-formedness of &'a T: what a reference points at outlives the reference. For
+            // `ref T value` with a T that has a slot, T's lifetime outlives the borrow.
+            for (int i = 0; i < m.ParameterCount; i++)
+                if (m.Parameters[i].RefKind != RefKind.None && m.Parameters[i].Type is TypeParameterSymbol referent && HasSlot(referent)
+                    && sig.Inputs[first + i] is { } borrowName && borrowName != TypeParameterLifetime(referent))
+                    sig.Bounds.Add((TypeParameterLifetime(referent), borrowName));
 
             // The containing types' own `where T : 'static` clauses hold in every method.
             for (var outer = m.ContainingType; outer is not null; outer = outer.ContainingType)
@@ -599,7 +641,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             // may be a reference for some T, and then it points at what the ref struct borrows.
             bool genericFromRefStruct = !m.ReturnsVoid && m.ContainingType.IsRefLikeType && MentionsTypeParameter(m.ReturnType);
             // By value only: a `ref T` result is a borrow, named by elision, of data that lives for 'T.
-            var parametricResult = m.ReturnsVoid || m.RefKind != RefKind.None ? new List<TypeParameterSymbol>() : ParametricIn(m.ReturnType);
+            var parametricResult = m.ReturnsVoid || m.RefKind != RefKind.None || referenceType ? new List<TypeParameterSymbol>() : ParametricIn(m.ReturnType);
             bool returnsBorrow = m.RefKind != RefKind.None || (!m.ReturnsVoid && (IsBorrowHolder(m.ReturnType) || MayCarry(m, m.ReturnType))) || genericFromRefStruct
                 || parametricResult.Count > 0;
             if (!returnsBorrow) return sig;
@@ -639,7 +681,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 explicitOut = (returnSyntax as RefTypeSyntax)?.LifetimeToken.ValueText;
                 if (string.IsNullOrEmpty(explicitOut) && decl is MethodDeclarationSyntax md) explicitOut = ExplicitLifetime(md.Modifiers);
                 // `Ref<'a, int> Pick(...)`: a result of a type with one named lifetime lives for it.
-                if (string.IsNullOrEmpty(explicitOut) && sig.OutputSlots is { Length: 1 } one && !one[0].StartsWith("'#", System.StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(explicitOut) && sig.OutputSlots is { Length: > 0 } one && Lifetimes.WrittenCount(m.ReturnType) == 1
+                    && !one[0].StartsWith("'#", System.StringComparison.Ordinal))
                     explicitOut = one[0];
             }
 
