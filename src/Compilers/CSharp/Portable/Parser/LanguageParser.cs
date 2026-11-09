@@ -1794,6 +1794,21 @@ namespace Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax
             var baseList = isExtension ? null : this.ParseBaseList();
             _termState = saveTerm;
 
+            // RustSharp: `class Registry<T> where T : 'static`. Like a method's, the clause stays out of the
+            // tree proper, as skipped tokens behind what was parsed last; Ownership/Lifetimes.cs reads it.
+            while (this.Options.IsOwnershipEnabled && this.CurrentToken.ContextualKind == SyntaxKind.WhereKeyword
+                && (this.PeekToken(1).Kind == SyntaxKind.LifetimeToken
+                    || (this.PeekToken(1).Kind == SyntaxKind.IdentifierToken && this.PeekToken(2).Kind == SyntaxKind.ColonToken && this.PeekToken(3).Kind == SyntaxKind.LifetimeToken)))
+            {
+                for (int k = 0; k < 4; k++)
+                {
+                    var token = k switch { 2 => this.EatToken(SyntaxKind.ColonToken), 3 => this.EatToken(SyntaxKind.LifetimeToken), _ => this.EatToken() };
+                    if (baseList != null) baseList = AddTrailingSkippedSyntax(baseList, token);
+                    else if (typeParameters != null) typeParameters = AddTrailingSkippedSyntax(typeParameters, token);
+                    else name = AddTrailingSkippedSyntax(name, token);
+                }
+            }
+
             // Parse class body
             bool parseMembers = true;
             SyntaxListBuilder<MemberDeclarationSyntax> members = default;

@@ -569,6 +569,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 for (int i = 0; i + 1 < names.Count; i += 2) sig.Bounds.Add((names[i], names[i + 1]));
             }
 
+            // The containing types' own `where T : 'static` clauses hold in every method.
+            for (var outer = m.ContainingType; outer is not null; outer = outer.ContainingType)
+                sig.Bounds.AddRange(Lifetimes.TypeBounds(outer));
+
             // A trait bound `T : IStore<U>` lets T hold U, as Rust's impl would: U outlives T. The body may
             // assume it; every caller must show it.
             var withBounds = m.TypeParameters.AsEnumerable();

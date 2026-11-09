@@ -32,7 +32,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 foreach (var r in def.DeclaringSyntaxReferences)
                 {
                     if (r.GetSyntax() is not TypeDeclarationSyntax decl) continue;
-                    names = decl.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : InTrivia(decl.Identifier.TrailingTrivia);
+                    names = decl.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : ListInTrivia(decl.Identifier.TrailingTrivia);
                     if (names.Count > 0) break;
                 }
                 // After the written lifetimes, one implicit slot per type parameter: the lifetime of what
@@ -53,7 +53,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (t is not NamedTypeSymbol n) return 0;
             foreach (var r in n.OriginalDefinition.DeclaringSyntaxReferences)
                 if (r.GetSyntax() is TypeDeclarationSyntax decl
-                    && (decl.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : InTrivia(decl.Identifier.TrailingTrivia)) is { Count: > 0 } names)
+                    && (decl.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : ListInTrivia(decl.Identifier.TrailingTrivia)) is { Count: > 0 } names)
                     return names.Count;
             return 0;
         }
@@ -233,6 +233,51 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                     && (d.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : InTrivia(d.Identifier.TrailingTrivia)).Count > 0)
                     return true;
             return false;
+        }
+
+        /// <summary>The lifetimes of a declaration's list `&lt;'a, 'b&gt;` alone, not of a `where` clause after it.</summary>
+        private static List<string> ListInTrivia(SyntaxTriviaList trivia)
+        {
+            var names = new List<string>();
+            bool inside = false;
+            foreach (var t in trivia)
+                if (t.IsKind(SyntaxKind.SkippedTokensTrivia))
+                    foreach (var token in ((SkippedTokensTriviaSyntax)t.GetStructure()).Tokens)
+                    {
+                        if (token.IsKind(SyntaxKind.LessThanToken)) inside = true;
+                        else if (token.IsKind(SyntaxKind.GreaterThanToken)) return names;
+                        else if (inside && token.IsKind(SyntaxKind.LifetimeToken)) names.Add(token.ValueText);
+                    }
+            return names;
+        }
+
+        /// <summary>
+        /// A type's `where T : 'a` and `where 'a : 'b` clauses, as (longer, shorter): they hold in all its
+        /// methods. A type parameter stands for its lifetime 'T.
+        /// </summary>
+        public static List<(string Longer, string Shorter)> TypeBounds(NamedTypeSymbol type)
+        {
+            var bounds = new List<(string, string)>();
+            var def = type.OriginalDefinition;
+            foreach (var r in def.DeclaringSyntaxReferences)
+            {
+                if (r.GetSyntax() is not TypeDeclarationSyntax decl) continue;
+                var trivia = decl.BaseList?.GetTrailingTrivia() ?? decl.TypeParameterList?.GetTrailingTrivia() ?? decl.Identifier.TrailingTrivia;
+                var names = new List<string>();
+                bool inClause = false;
+                foreach (var t in trivia)
+                    if (t.IsKind(SyntaxKind.SkippedTokensTrivia))
+                        foreach (var token in ((SkippedTokensTriviaSyntax)t.GetStructure()).Tokens)
+                        {
+                            if (token.ContextualKind() == SyntaxKind.WhereKeyword || token.ValueText == "where") { inClause = true; continue; }
+                            if (!inClause) continue;
+                            if (token.IsKind(SyntaxKind.LifetimeToken)) names.Add(token.ValueText);
+                            else if (token.IsKind(SyntaxKind.IdentifierToken) && def.TypeParameters.FirstOrDefault(p => p.Name == token.ValueText) is { } tp)
+                                names.Add(OwnershipFacts.IsParametric(tp) ? OwnershipFacts.TypeParameterLifetime(tp) : "'static");
+                        }
+                for (int i = 0; i + 1 < names.Count; i += 2) bounds.Add((names[i], names[i + 1]));
+            }
+            return bounds;
         }
 
         private static List<string> InTrivia(SyntaxTriviaList trivia)
