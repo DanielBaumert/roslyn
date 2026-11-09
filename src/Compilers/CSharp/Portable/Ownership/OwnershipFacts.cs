@@ -384,6 +384,31 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         public static LifetimeSig GetLifetimeSig(MethodSymbol method)
             => s_sigs.GetOrAdd(method.OriginalDefinition, static m => ElideOutputSlots(ComputeSig(m)));
 
+        /// <summary>A delegate's Invoke signature for a lambda body: the environment takes the place of the delegate.</summary>
+        private static LifetimeSig ForLambda(LifetimeSig invoke, LifetimeSig own, bool isStatic)
+        {
+            int skip = isStatic ? 1 : 0;
+            var inputs = invoke.Inputs.Skip(skip).ToArray();
+            var slots = invoke.InputSlots?.Skip(skip).Select(x => (string[])x?.Clone()).ToArray() ?? new string[inputs.Length][];
+            // `this` is the lambda's own: its environment, or the object whose method it lives in, with
+            // that object's lifetimes. Only the parameters and the result follow Invoke.
+            if (!isStatic && own.Inputs.Length > 0 && inputs.Length > 0)
+            {
+                inputs[0] = own.Inputs[0];
+                slots[0] = own.InputSlots?[0];
+            }
+            return new LifetimeSig
+            {
+                Inputs = inputs,
+                InputSlots = slots,
+                Output = invoke.Output,
+                OutputSlots = (string[])invoke.OutputSlots?.Clone(),
+                OutputFromAll = invoke.OutputFromAll,
+                MissingSpecifier = false,
+                Bounds = new List<(string, string)>(invoke.Bounds),
+            };
+        }
+
         /// <summary>The name of an output slot that is simply the lifetime of the whole result.</summary>
         public const string WholeResult = "'#result";
 
@@ -413,7 +438,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             var inputs = new List<string>();
             var scoped = new List<bool>();
             var decl = m.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax();
-            var paramList = (decl as BaseMethodDeclarationSyntax)?.ParameterList;
+            var paramList = (decl as BaseMethodDeclarationSyntax)?.ParameterList ?? (decl as DelegateDeclarationSyntax)?.ParameterList;
+            var returnSyntax = (decl as MethodDeclarationSyntax)?.ReturnType ?? (decl as DelegateDeclarationSyntax)?.ReturnType;
 
             var thisMode = GetThisMode(m);
             bool thisBorrows = thisMode is ThisMode.Shared or ThisMode.Mut;
@@ -455,7 +481,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 var typeSyntax = paramList != null && i < paramList.Parameters.Count ? paramList.Parameters[i].Type : null;
                 sig.InputSlots[first + i] = Lifetimes.Slots(m.Parameters[i].Type, typeSyntax, i.ToString());
             }
-            sig.OutputSlots = Lifetimes.Slots(m.ReturnType, (decl as MethodDeclarationSyntax)?.ReturnType, "ret");
+            sig.OutputSlots = Lifetimes.Slots(m.ReturnType, returnSyntax, "ret");
 
             // A value of a type with one lifetime, such as Ref<'a, T>, lives exactly as long as that
             // lifetime: `Ref<'a, int> x` is an input named 'a, like Rust's `x: &'a i32`.
@@ -494,7 +520,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             // result to every input, the delegate included (for a [Mut] one, its exclusive borrow). A lambda's
             // body may then return a borrow of any of them: its captures, or the data behind an argument,
             // as in `OrderBy(s => s)` on Ref<string> items. Both sides agree, as Rust's closure signatures do.
-            if (IsClosureBody(m) || m.MethodKind == MethodKind.DelegateInvoke)
+            // A delegate type that declares lifetimes says where the result comes from, like Rust's
+            // `for<'a> Fn(&'a i32) -> &'a i32`: its Invoke is computed like any method, and a lambda body
+            // converted to it must keep exactly that signature, so it cannot return its captures instead.
+            if (IsClosureBody(m) && Lifetimes.TargetDelegate(m) is { DelegateInvokeMethod: { } invoke } target && Lifetimes.DelegateDeclaresLifetimes(target))
+                return ForLambda(GetLifetimeSig(invoke), sig, m.IsStatic);
+            if (IsClosureBody(m) || (m.MethodKind == MethodKind.DelegateInvoke && !Lifetimes.DelegateDeclaresLifetimes(m.ContainingType)))
             {
                 sig.OutputFromAll = true;
                 return sig;
@@ -515,10 +546,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             }
 
             string explicitOut = null;
-            if (decl is MethodDeclarationSyntax md)
+            if (decl is MethodDeclarationSyntax or DelegateDeclarationSyntax)
             {
-                explicitOut = (md.ReturnType as RefTypeSyntax)?.LifetimeToken.ValueText;
-                if (string.IsNullOrEmpty(explicitOut)) explicitOut = ExplicitLifetime(md.Modifiers);
+                explicitOut = (returnSyntax as RefTypeSyntax)?.LifetimeToken.ValueText;
+                if (string.IsNullOrEmpty(explicitOut) && decl is MethodDeclarationSyntax md) explicitOut = ExplicitLifetime(md.Modifiers);
                 // `Ref<'a, int> Pick(...)`: a result of a type with one named lifetime lives for it.
                 if (string.IsNullOrEmpty(explicitOut) && sig.OutputSlots is { Length: 1 } one && !one[0].StartsWith("'#", System.StringComparison.Ordinal))
                     explicitOut = one[0];

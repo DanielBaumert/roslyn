@@ -456,7 +456,12 @@ namespace Microsoft.CodeAnalysis.CSharp
         public MessageID MessageID { get { return Data.MessageID; } }
 
         public BoundLambda Bind(NamedTypeSymbol delegateType, bool isExpressionTree)
-            => SuppressIfNeeded(Data.Bind(delegateType, isExpressionTree));
+        {
+            var bound = SuppressIfNeeded(Data.Bind(delegateType, isExpressionTree));
+            // RustSharp: a lambda's body follows the lifetimes its delegate type declares.
+            if (Binder.IsNullFree(Syntax)) Ownership.Lifetimes.RecordLambdaTarget(bound.Symbol, delegateType);
+            return bound;
+        }
 
         public BoundLambda BindForErrorRecovery()
             => SuppressIfNeeded(Data.BindForErrorRecovery());

@@ -111,6 +111,32 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             return names;
         }
 
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<MethodSymbol, NamedTypeSymbol> s_lambdaTargets = new();
+
+        /// <summary>The binder records the delegate type each lambda was converted to.</summary>
+        public static void RecordLambdaTarget(MethodSymbol lambda, NamedTypeSymbol delegateType)
+        {
+            if (lambda is not null && delegateType is not null) s_lambdaTargets.AddOrUpdate(lambda, delegateType);
+        }
+
+        /// <summary>The delegate type a closure body's lambda was converted to, or null.</summary>
+        public static NamedTypeSymbol TargetDelegate(MethodSymbol closureBody)
+            => closureBody.OriginalDefinition is SynthesizedClosureMethod { LambdaOrLocalFunction: { } lambda } && s_lambdaTargets.TryGetValue(lambda, out var t) ? t : null;
+
+        /// <summary>
+        /// Whether a delegate type declares lifetimes, as in <c>delegate Ref&lt;'a, int&gt; Id&lt;'a&gt;(Ref&lt;'a, int&gt; x)</c>,
+        /// Rust's <c>for&lt;'a&gt; Fn(&amp;'a i32) -&gt; &amp;'a i32</c>: they belong to each call, not to the delegate value.
+        /// </summary>
+        public static bool DelegateDeclaresLifetimes(TypeSymbol t)
+        {
+            if (t is not NamedTypeSymbol { TypeKind: TypeKind.Delegate } n) return false;
+            foreach (var r in n.OriginalDefinition.DeclaringSyntaxReferences)
+                if (r.GetSyntax() is DelegateDeclarationSyntax d
+                    && (d.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : InTrivia(d.Identifier.TrailingTrivia)).Count > 0)
+                    return true;
+            return false;
+        }
+
         private static List<string> InTrivia(SyntaxTriviaList trivia)
         {
             var names = new List<string>();

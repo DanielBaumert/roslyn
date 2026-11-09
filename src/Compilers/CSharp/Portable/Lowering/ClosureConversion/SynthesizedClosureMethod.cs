@@ -20,6 +20,9 @@ namespace Microsoft.CodeAnalysis.CSharp
         private readonly ImmutableArray<NamedTypeSymbol> _structEnvironments;
 
         internal MethodSymbol TopLevelMethod { get; }
+
+        /// <summary>RustSharp: the lambda or local function this method was made from.</summary>
+        internal MethodSymbol LambdaOrLocalFunction => BaseMethod;
         internal readonly DebugId LambdaId;
 
         internal SynthesizedClosureMethod(

@@ -166,6 +166,34 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         }
 
         /// <summary>
+        /// A method converted to a delegate type that declares lifetimes: callers of Invoke rely on that
+        /// signature, so the method's result may only come from the inputs Invoke names for it. A static
+        /// method has no `this`, so its inputs sit one place later in Invoke's.
+        /// </summary>
+        private void CheckDelegateContract(MethodSymbol m, MethodSymbol invoke, SyntaxNode syntax)
+        {
+            var mine = OwnershipFacts.GetLifetimeSig(m);
+            var theirs = OwnershipFacts.GetLifetimeSig(invoke);
+            if (mine.Output is null && !mine.OutputFromAll) return;
+            if (mine.Output == "'static" || theirs.OutputFromAll) return;
+            int offset = m.IsStatic ? 1 : 0;
+            for (int i = 0; i < mine.Inputs.Length; i++)
+            {
+                bool usesInput = mine.OutputFromAll ? mine.Inputs[i] != null
+                    : mine.Inputs[i] == mine.Output || (mine.InputSlots?[i] is { } ms && System.Array.IndexOf(ms, mine.Output) >= 0);
+                int j = i + offset;
+                bool allowed = j < theirs.Inputs.Length && theirs.Output != null
+                    && (theirs.Inputs[j] == theirs.Output || (theirs.InputSlots?[j] is { } ts && System.Array.IndexOf(ts, theirs.Output) >= 0));
+                if (usesInput && !allowed)
+                {
+                    Report(ErrorCode.ERR_OwnLifetimeMismatch, $"lifetime of `{m.Name}` does not match `{invoke.ContainingType.Name}`",
+                        syntax, "the result borrows from an input the delegate type does not name for it");
+                    return;
+                }
+            }
+        }
+
+        /// <summary>
         /// Callers rely on the declared receiver mode. An implementation may promise more (`readonly`
         /// where mutation was allowed) but never less, and whether `this` is consumed must agree:
         /// otherwise a caller keeps a value the callee already freed.
@@ -837,14 +865,18 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
 
             // Lifetime parameters of the inputs: each slot is the universal region its name stands for, and
             // outlives the value as a whole (a Pair<'a, 'b> is valid only while 'a and 'b are).
-            for (int i = 0; i < sig.Inputs.Length && i < _b.ArgCount; i++)
+            // An input's lifetimes are unknown to the body, so every slot of an argument is a universal
+            // region, named or not: a free region would satisfy any constraint.
+            for (int local = 1; local <= _b.ArgCount; local++)
             {
-                int local = i + 1;
-                if (sig.InputSlots?[i] is not { } names || _localSlots[local] is not { } slots || slots.Length != names.Length) continue;
+                if (_localSlots[local] is not { } slots) continue;
+                int i = local - 1;
+                var names = i < sig.Inputs.Length ? sig.InputSlots?[i] : null;
+                if (names is not null && names.Length != slots.Length) names = null;
                 int whole = _localInner[local] >= 0 ? _localInner[local] : _localRegion[local];
                 for (int k = 0; k < slots.Length; k++)
                 {
-                    slots[k] = Universal(names[k]);
+                    slots[k] = Universal(names?[k] ?? "'#unnamed" + local + "." + k);
                     if (whole >= 0) DeclareOutlives(slots[k], whole);
                 }
             }
@@ -916,6 +948,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 {
                     if (s is AssignStmt a)
                     {
+                        if (a.Value is NewDelegateRv nd && !OwnershipFacts.IsClosureBody(nd.Method) && _b.TypeOf(a.Dest).Type is NamedTypeSymbol { DelegateInvokeMethod: { } invoke } dt
+                            && Lifetimes.DelegateDeclaresLifetimes(dt))
+                            CheckDelegateContract(nd.Method, invoke, a.Syntax);
                         int dest = RegionOf(a.Dest);
                         if (a.Value is RefRv r)
                         {
