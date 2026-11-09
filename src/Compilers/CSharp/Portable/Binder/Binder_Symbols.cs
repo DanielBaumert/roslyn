@@ -864,7 +864,7 @@ namespace Microsoft.CodeAnalysis.CSharp
         {
             if (!IsNullFree(syntax) || result.NamespaceOrTypeSymbol is not TypeSymbol { TypeKind: not TypeKind.Error } type) return result;
             int written = Ownership.Lifetimes.Arguments(syntax).Count;
-            int declared = Ownership.Lifetimes.Declared(type).Length;
+            int declared = Ownership.Lifetimes.WrittenOnly(type);
             if (written != 0 && written != declared) Error(diagnostics, ErrorCode.ERR_OwnLifetimeArity, syntax, type, declared, written);
             return result;
         }

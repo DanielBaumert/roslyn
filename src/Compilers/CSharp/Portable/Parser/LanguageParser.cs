@@ -3566,7 +3566,10 @@ parse_member_name:;
 
             // RustSharp: `where 'a : 'b`. Lifetimes are no type parameters, so the clause stays out of the
             // tree proper and the ownership analysis reads it from the skipped tokens.
-            while (this.Options.IsOwnershipEnabled && this.CurrentToken.ContextualKind == SyntaxKind.WhereKeyword && this.PeekToken(1).Kind == SyntaxKind.LifetimeToken)
+            // `where T : 'a` too: a type parameter that outlives a lifetime, like Rust's `T: 'a`.
+            while (this.Options.IsOwnershipEnabled && this.CurrentToken.ContextualKind == SyntaxKind.WhereKeyword
+                && (this.PeekToken(1).Kind == SyntaxKind.LifetimeToken
+                    || (this.PeekToken(1).Kind == SyntaxKind.IdentifierToken && this.PeekToken(2).Kind == SyntaxKind.ColonToken && this.PeekToken(3).Kind == SyntaxKind.LifetimeToken)))
             {
                 paramList = AddTrailingSkippedSyntax(paramList, this.EatToken());
                 paramList = AddTrailingSkippedSyntax(paramList, this.EatToken());

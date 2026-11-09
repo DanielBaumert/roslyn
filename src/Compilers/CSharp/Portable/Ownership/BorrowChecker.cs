@@ -675,13 +675,55 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         {
             if (p is null || p.Static is not null || _localSlots[p.Local] is not { } slots) return null;
             if (p.Projs.IsEmpty) return slots;
-            return p.Projs.Length == 1 && p.Projs[0] is DerefProj && IsIndirect(p.Local) ? slots : null;
+            if (p.Projs.Length == 1 && p.Projs[0] is DerefProj && IsIndirect(p.Local)) return slots;
+            // `ref Stack<T> s`: through the reference, then the class's handle.
+            if (p.Projs.Length == 2 && p.Projs[0] is DerefProj && p.Projs[1] is DerefProj && IsRefToHandle(p.Local)) return slots;
+            return FieldObjectSlots(p, slots);
+        }
+
+        /// <summary>
+        /// The slots of the object a field holds (`this._inner` for a `Stack&lt;T&gt; _inner` in an `Outer&lt;T&gt;`), in
+        /// terms of the container's slots: Stack's T slot is Outer's. A lifetime the container does not
+        /// have is 'static, as for any place no region tracks.
+        /// </summary>
+        private int[] FieldObjectSlots(Place p, int[] container)
+        {
+            int i = IsIndirect(p.Local) ? 1 : 0;
+            if (i == 1 && (p.Projs.Length == 0 || p.Projs[0] is not DerefProj)) return null;
+            if (i == 1 && IsRefToHandle(p.Local) && p.Projs.Length > 1 && p.Projs[1] is DerefProj) i = 2;
+            if (i >= p.Projs.Length || p.Projs[i] is not FieldProj f) return null;
+            int rest = p.Projs.Length - i - 1;
+            if (rest > 1 || (rest == 1 && (p.Projs[^1] is not DerefProj || f.Field.Type.TypeKind is not (TypeKind.Class or TypeKind.Interface)))) return null;
+            var names = Lifetimes.Slots(f.Field.OriginalDefinition.Type, Lifetimes.FieldTypeSyntax(f.Field), "field");
+            if (names is null) return null;
+            var containerNames = Lifetimes.Declared(_b.Locals[p.Local].Type.Type);
+            var result = new int[names.Length];
+            for (int k = 0; k < names.Length; k++)
+            {
+                if (names[k] == "'static") { result[k] = Universal("'static"); continue; }
+                int at = containerNames.IndexOf(names[k]);
+                // A lifetime the container does not name: no mapping, as before.
+                if (at < 0 || at >= container.Length) return null;
+                result[k] = container[at];
+            }
+            return result;
         }
 
         private int[] SlotsOf(Operand op) => SlotsOf(op is CopyOp c ? c.Place : op is MoveOp m ? m.Place : null);
 
+        /// <summary>Whether a type parameter belongs to the method being checked or to a type around it.</summary>
+        private bool OwnsTypeParameter(TypeParameterSymbol tp)
+        {
+            for (Symbol s = _b.Method.OriginalDefinition; s is not null; s = s.ContainingSymbol)
+                if (ReferenceEquals(tp.ContainingSymbol.OriginalDefinition, s.OriginalDefinition)) return true;
+            return false;
+        }
+
         /// <summary>Whether a local reaches its value through a dereference: a reference, or a class's handle.</summary>
         private bool IsIndirect(int local) => _b.Locals[local].Type.IsRef || _b.Locals[local].Type.Type.TypeKind == TypeKind.Class;
+
+        /// <summary>A reference to a class's handle, such as `ref Stack&lt;T&gt; s` (not `&amp;contents`, which points at the object).</summary>
+        private bool IsRefToHandle(int local) => _b.Locals[local].Type is { IsRef: true, Contents: false } t && t.Type.TypeKind is TypeKind.Class or TypeKind.Interface;
 
         /// <summary>The field of a lifetime-parameterized value that a place goes through, with its slot; -1 if none.</summary>
         private int SlotField(Place p, out FieldSymbol field)
@@ -690,6 +732,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (p.Static is not null || _localSlots[p.Local] is null) return -1;
             int i = IsIndirect(p.Local) ? 1 : 0;
             if (i == 1 && (p.Projs.Length == 0 || p.Projs[0] is not DerefProj)) return -1;
+            if (i == 1 && IsRefToHandle(p.Local) && p.Projs.Length > 1 && p.Projs[1] is DerefProj) i = 2;
             if (i >= p.Projs.Length || p.Projs[i] is not FieldProj f) return -1;
             field = f.Field;
             return Lifetimes.FieldSlot(f.Field);
@@ -739,7 +782,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             var t = BaseType(p);
             foreach (var proj in p.Projs)
             {
-                if (t.Contents && !OwnershipFacts.IsCoroutineType(t.Type)) return -1;
+                if (t.Contents && !OwnershipFacts.IsCoroutineType(t.Type) && !OwnershipFacts.AnonymousHoldsBorrows(t.Type)) return -1;
                 t = MirBody.Project(t, proj);
             }
 
@@ -1093,6 +1136,41 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
 
             foreach (var (longer, shorter) in sig.Bounds) Outlives(Fresh(longer), Fresh(shorter), c.Syntax);
 
+            // A value passed where the callee sees a type parameter (`T x`, `ref T x`) brings all its regions,
+            // its slots too: T may stand for a Pair<'a, 'b>, and the callee only knows 'T.
+            for (int i = 0; i < c.Args.Count && i < sig.Inputs.Length; i++)
+            {
+                if (sig.Inputs[i] is not { } tname || !tname.StartsWith("'#T:", StringComparison.Ordinal) || SlotsOf(c.Args[i]) is not { } held) continue;
+                var heldPlace = c.Args[i] is CopyOp hc ? hc.Place : ((MoveOp)c.Args[i]).Place;
+                bool storesInto = _b.TypeOf(heldPlace).Ref == RefMode.Mut;
+                foreach (var slot in held)
+                {
+                    Outlives(slot, Fresh(tname), c.Syntax);
+                    if (storesInto) Outlives(Fresh(tname), slot, c.Syntax);
+                }
+            }
+
+            // A receiver without slots of its own, such as a value of type T bound by `T : IStore<U>`: the
+            // callee's slots stand for the type arguments it was called with, here U's lifetime. What
+            // cannot be named is 'static, as for any place no region tracks.
+            if (!m.IsStatic && c.Args.Count > 0 && sig.InputSlots?[0] is { } receiverNames && SlotsOf(c.Args[0]) is null && m.ContainingType is { } callee)
+            {
+                int written = Lifetimes.WrittenCount(callee);
+                var args = callee.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics;
+                for (int k = 0; k < receiverNames.Length; k++)
+                {
+                    int i = k - written;
+                    int region = Universal("'static");
+                    if (i >= 0 && i < args.Length)
+                    {
+                        var parametric = OwnershipFacts.ParametricIn(args[i].Type);
+                        if (parametric.Count == 1 && OwnsTypeParameter(parametric[0])) region = Universal(OwnershipFacts.TypeParameterLifetime(parametric[0]));
+                    }
+                    Outlives(region, Fresh(receiverNames[k]), c.Syntax);
+                    Outlives(Fresh(receiverNames[k]), region, c.Syntax);
+                }
+            }
+
             // Lifetime parameters: each slot of an argument outlives the lifetime its parameter names;
             // through `ref` (or a constructor's `this`) the callee may store into it, so the slot is invariant.
             for (int i = 0; sig.InputSlots != null && i < c.Args.Count && i < sig.InputSlots.Length; i++)
@@ -1129,6 +1207,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (sig.OutputSlots is { } outNames && SlotsOf(c.Dest) is { } outSlots && outSlots.Length == outNames.Length)
                 for (int k = 0; k < outSlots.Length; k++)
                     Outlives(outNames[k] == OwnershipFacts.WholeResult ? (c.Dest.IsLocal && _b.Locals[c.Dest.Local].Type.IsRef ? destInner : dest) : Fresh(outNames[k]), outSlots[k], c.Syntax);
+
+            // A result the callee sees as a type parameter brings no region of its own beyond 'T.
+            if (sig.Output is { } outT && outT.StartsWith("'#T:", StringComparison.Ordinal) && SlotsOf(c.Dest) is { } resultSlots)
+                foreach (var slot in resultSlots) Outlives(Fresh(outT), slot, c.Syntax);
 
             // A result named after an input's slot (`ref readonly 'a int First(in Pair<'a, 'b> p)`) lives for that slot.
             if (sig.IsSlotName(sig.Output))
@@ -1381,6 +1463,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (!lifetime.StartsWith("'#", StringComparison.Ordinal)) return "`" + lifetime + "`";
             var rest = lifetime.Substring(2);
             if (rest == "this") return "the lifetime of `this`";
+            if (rest.StartsWith("T:", StringComparison.Ordinal)) return $"the lifetime of `{rest.Substring(2)}`";
             if (int.TryParse(rest, out int i) && i < _b.Method.ParameterCount)
                 return $"the lifetime of `{_b.Method.Parameters[i].Name}`";
             return "an anonymous lifetime";

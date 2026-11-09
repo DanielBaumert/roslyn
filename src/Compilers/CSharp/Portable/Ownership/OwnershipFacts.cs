@@ -232,14 +232,64 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// delegate behaves like Rust's <c>Box&lt;dyn Fn() + 'a&gt;</c>: its lifetime is that of what it captures.
         /// </summary>
         public static bool IsBorrowHolder(TypeSymbol t) => t.IsRefLikeOrAllowsRefLikeType() || t.IsDelegateType() || IsCoroutineType(t)
-            || IsReference(t) || CarriesBorrows(t) || HasLifetimeParameters(t);
+            || IsReference(t) || CarriesBorrows(t) || HasLifetimeParameters(t) || (t is TypeParameterSymbol tp && IsParametric(tp))
+            || AnonymousHoldsBorrows(t);
+
+        /// <summary>
+        /// An anonymous object whose properties hold borrows (`new { Item = value }` with a T or a Ref): it is
+        /// immutable and has one owner, so what it holds lives as long as that owner.
+        /// </summary>
+        public static bool AnonymousHoldsBorrows(TypeSymbol t)
+            => t.IsAnonymousType && t.GetMembers().OfType<PropertySymbol>().Any(p => IsBorrowHolder(p.Type) || CarriesBorrowsOrSlots(p.Type));
+
+        /// <summary>
+        /// A type parameter of a generic method in the program carries a lifetime of its own, 'T, as in Rust:
+        /// the body is checked with it unknown, so callers may pass references, and storing a T where no
+        /// lifetime is tracked needs <c>where T : 'static</c>. The core library's generics stay trusted
+        /// ([CarriesBorrows]); an unmanaged T holds no borrows, and an `allows ref struct` one is a holder anyway.
+        /// </summary>
+        public static bool IsParametric(TypeParameterSymbol tp)
+        {
+            if (tp.HasUnmanagedTypeConstraint || tp.AllowsRefLikeType) return false;
+            return tp.ContainingSymbol switch
+            {
+                MethodSymbol { MethodKind: not MethodKind.LambdaMethod } m => IsUserType(m.ContainingType),
+                // A type's own parameters: Stack<T> holds T for T's lifetime, one implicit slot per parameter.
+                NamedTypeSymbol { TypeKind: TypeKind.Class or TypeKind.Struct or TypeKind.Interface } n => IsUserType(n),
+                _ => false,
+            };
+        }
+
+        /// <summary>Whether a type holds borrows through Result/Option-like containers or lifetime slots.</summary>
+        public static bool CarriesBorrowsOrSlots(TypeSymbol t)
+            => CarriesBorrows(t) || HasLifetimeParameters(t) || (t is NamedTypeSymbol n && n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics.Any(a => IsBorrowHolder(a.Type) || CarriesBorrowsOrSlots(a.Type)));
+
+        /// <summary>The lifetime a parametric type parameter carries, as named in signatures: `'#T:Stack.T`.</summary>
+        public static string TypeParameterLifetime(TypeParameterSymbol tp) => "'#T:" + tp.ContainingSymbol.Name + "." + tp.Name;
+
+        /// <summary>The parametric type parameters a type mentions, in order of appearance.</summary>
+        public static List<TypeParameterSymbol> ParametricIn(TypeSymbol t)
+        {
+            var found = new List<TypeParameterSymbol>();
+            void Walk(TypeSymbol x)
+            {
+                switch (x)
+                {
+                    case TypeParameterSymbol tp when IsParametric(tp): if (!found.Contains(tp)) found.Add(tp); break;
+                    case ArrayTypeSymbol a: Walk(a.ElementType); break;
+                    case NamedTypeSymbol n: foreach (var a in n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics) Walk(a.Type); break;
+                }
+            }
+            Walk(t);
+            return found;
+        }
 
         /// <summary>
         /// A class or struct that declares lifetimes, like Rust's <c>struct Index&lt;'a&gt;</c>: it may hold borrows in
         /// the fields that name them. A class is Rust's <c>Box&lt;Index&lt;'a&gt;&gt;</c>, its one owner keeps them alive.
         /// </summary>
         public static bool HasLifetimeParameters(TypeSymbol t)
-            => t.TypeKind is TypeKind.Class or TypeKind.Struct && !Lifetimes.Declared(t).IsEmpty;
+            => t.TypeKind is TypeKind.Class or TypeKind.Struct or TypeKind.Interface && !Lifetimes.Declared(t).IsEmpty;
 
         /// <summary>Ref&lt;T&gt; and RefMut&lt;T&gt;: Rust's &amp;T and &amp;mut T as values, usable as type arguments.</summary>
         public static bool IsReference(TypeSymbol t) => t is NamedTypeSymbol && HasAttribute(t, "ReferenceAttribute");
@@ -472,6 +522,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 string name = null;
                 if (paramList != null && i < paramList.Parameters.Count)
                     name = ExplicitLifetime(paramList.Parameters[i].Modifiers);
+                // A parameter that carries one of the method's own type parameters lives for its lifetime 'T.
+                var parametric = ParametricIn(p.Type);
+                if (parametric.Count > 0) borrow = true;
+                if (name is null && parametric.Count == 1) name = TypeParameterLifetime(parametric[0]);
                 inputs.Add(borrow ? name ?? "'#" + i : null);
                 scoped.Add(p.EffectiveScope != ScopedKind.None);
             }
@@ -500,15 +554,31 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 if (sig.InputSlots[i] is { Length: 1 } one && !one[0].StartsWith("'#", System.StringComparison.Ordinal) && sig.Inputs[i] == "'#" + (i - first))
                     sig.Inputs[i] = one[0];
 
-            // The parser keeps `where 'a : 'b` as skipped tokens behind the parameter list.
+            // The parser keeps `where 'a : 'b` and `where T : 'a` as skipped tokens behind the parameter list.
             if (paramList != null)
             {
                 var names = new List<string>();
                 foreach (var trivia in paramList.GetTrailingTrivia())
                     if (trivia.IsKind(SyntaxKind.SkippedTokensTrivia))
                         foreach (var token in ((SkippedTokensTriviaSyntax)trivia.GetStructure()).Tokens)
+                        {
                             if (token.IsKind(SyntaxKind.LifetimeToken)) names.Add(token.ValueText);
+                            else if (token.IsKind(SyntaxKind.IdentifierToken) && m.TypeParameters.FirstOrDefault(t => t.Name == token.ValueText) is { } bounded)
+                                names.Add(IsParametric(bounded) ? TypeParameterLifetime(bounded) : "'static");
+                        }
                 for (int i = 0; i + 1 < names.Count; i += 2) sig.Bounds.Add((names[i], names[i + 1]));
+            }
+
+            // A trait bound `T : IStore<U>` lets T hold U, as Rust's impl would: U outlives T. The body may
+            // assume it; every caller must show it.
+            var withBounds = m.TypeParameters.AsEnumerable();
+            for (var outer = m.ContainingType; outer is not null; outer = outer.ContainingType) withBounds = withBounds.Concat(outer.TypeParameters);
+            foreach (var tp in withBounds)
+            {
+                if (!IsParametric(tp)) continue;
+                foreach (var constraint in tp.ConstraintTypesNoUseSiteDiagnostics)
+                    foreach (var held in ParametricIn(constraint.Type))
+                        if (!Equals(held, tp)) sig.Bounds.Add((TypeParameterLifetime(held), TypeParameterLifetime(tp)));
             }
 
             // A ref-struct constructor stores its arguments: they all share the lifetime of `this`. With
@@ -524,7 +594,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             // A ref struct's own generic result (an iterator's `Option<T> Next()`, an enumerator's `T Current`)
             // may be a reference for some T, and then it points at what the ref struct borrows.
             bool genericFromRefStruct = !m.ReturnsVoid && m.ContainingType.IsRefLikeType && MentionsTypeParameter(m.ReturnType);
-            bool returnsBorrow = m.RefKind != RefKind.None || (!m.ReturnsVoid && (IsBorrowHolder(m.ReturnType) || MayCarry(m, m.ReturnType))) || genericFromRefStruct;
+            // By value only: a `ref T` result is a borrow, named by elision, of data that lives for 'T.
+            var parametricResult = m.ReturnsVoid || m.RefKind != RefKind.None ? new List<TypeParameterSymbol>() : ParametricIn(m.ReturnType);
+            bool returnsBorrow = m.RefKind != RefKind.None || (!m.ReturnsVoid && (IsBorrowHolder(m.ReturnType) || MayCarry(m, m.ReturnType))) || genericFromRefStruct
+                || parametricResult.Count > 0;
             if (!returnsBorrow) return sig;
 
             // Delegates: a caller of Invoke cannot see where a lambda's result comes from, so it binds the
@@ -564,6 +637,14 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 // `Ref<'a, int> Pick(...)`: a result of a type with one named lifetime lives for it.
                 if (string.IsNullOrEmpty(explicitOut) && sig.OutputSlots is { Length: 1 } one && !one[0].StartsWith("'#", System.StringComparison.Ordinal))
                     explicitOut = one[0];
+            }
+
+            // A result that carries the method's own type parameters lives for their lifetimes: `T Id<T>(T x)`.
+            if (string.IsNullOrEmpty(explicitOut) && parametricResult.Count == 1) explicitOut = TypeParameterLifetime(parametricResult[0]);
+            if (string.IsNullOrEmpty(explicitOut) && parametricResult.Count > 1)
+            {
+                sig.OutputFromAll = true;
+                return sig;
             }
 
             if (!string.IsNullOrEmpty(explicitOut))

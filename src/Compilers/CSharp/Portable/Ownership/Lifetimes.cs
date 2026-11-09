@@ -28,14 +28,84 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (t is not NamedTypeSymbol n) return ImmutableArray<string>.Empty;
             return s_declared.GetOrAdd(n.OriginalDefinition, static def =>
             {
+                var names = new List<string>();
                 foreach (var r in def.DeclaringSyntaxReferences)
                 {
                     if (r.GetSyntax() is not TypeDeclarationSyntax decl) continue;
-                    var names = decl.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : InTrivia(decl.Identifier.TrailingTrivia);
-                    if (names.Count > 0) return names.ToImmutableArray();
+                    names = decl.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : InTrivia(decl.Identifier.TrailingTrivia);
+                    if (names.Count > 0) break;
                 }
-                return ImmutableArray<string>.Empty;
+                // After the written lifetimes, one implicit slot per type parameter: the lifetime of what
+                // the type holds as that parameter, as Rust's Vec<&'a T> carries 'a in its T.
+                // A nested type (an enum's variant) also holds its containing types' parameters.
+                foreach (var tp in AllTypeParameters((NamedTypeSymbol)def))
+                    if (OwnershipFacts.IsParametric(tp)) names.Add(OwnershipFacts.TypeParameterLifetime(tp));
+                return names.ToImmutableArray();
             });
+        }
+
+        /// <summary>
+        /// The lifetimes a type's declaration writes, read from syntax alone: what the binder checks a
+        /// type's lifetime arguments against (CS9939), before any symbol is bound.
+        /// </summary>
+        public static int WrittenOnly(TypeSymbol t)
+        {
+            if (t is not NamedTypeSymbol n) return 0;
+            foreach (var r in n.OriginalDefinition.DeclaringSyntaxReferences)
+                if (r.GetSyntax() is TypeDeclarationSyntax decl
+                    && (decl.TypeParameterList is { } list ? InTrivia(list.LessThanToken.TrailingTrivia) : InTrivia(decl.Identifier.TrailingTrivia)) is { Count: > 0 } names)
+                    return names.Count;
+            return 0;
+        }
+
+        /// <summary>A type's parameters with those of its containing types first, as C# nests them.</summary>
+        private static List<TypeParameterSymbol> AllTypeParameters(NamedTypeSymbol n)
+        {
+            var all = n.ContainingType is { } outer ? AllTypeParameters(outer) : new List<TypeParameterSymbol>();
+            all.AddRange(n.TypeParameters);
+            return all;
+        }
+
+        /// <summary>A type's arguments with those of its containing types first, matching <see cref="AllTypeParameters"/>.</summary>
+        private static List<TypeSymbol> AllTypeArguments(NamedTypeSymbol n)
+        {
+            var all = n.ContainingType is { } outer ? AllTypeArguments(outer) : new List<TypeSymbol>();
+            all.AddRange(n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics.Select(a => a.Type));
+            return all;
+        }
+
+        /// <summary>How many of a type's slots are written lifetimes; the rest belong to its type parameters.</summary>
+        public static int WrittenCount(TypeSymbol t)
+            => Declared(t).Count(n => !n.StartsWith("'#T:", System.StringComparison.Ordinal));
+
+        /// <summary>
+        /// The lifetime a type argument brings into an implicit slot: a type parameter's own, 'static for
+        /// a type that cannot hold borrows, a single written lifetime (`Ref&lt;'a, int&gt;`), or none (null).
+        /// </summary>
+        public static string TypeArgumentLifetime(TypeSymbol argument, TypeSyntax syntax)
+        {
+            var parametric = OwnershipFacts.ParametricIn(argument);
+            if (parametric.Count == 1) return OwnershipFacts.TypeParameterLifetime(parametric[0]);
+            if (parametric.Count > 1) return null;
+            if (!OwnershipFacts.IsBorrowHolder(argument) && !OwnershipFacts.CarriesBorrowsOrSlots(argument)) return "'static";
+            if (syntax is not null && Nested(syntax) is { Count: > 0 } written && written.All(w => w == written[0]) && written[0] != "'_") return written[0];
+            return null;
+        }
+
+        private static TypeSyntax TypeArgumentSyntax(TypeSyntax syntax, int k)
+        {
+            while (true)
+            {
+                switch (syntax)
+                {
+                    case RefTypeSyntax r: syntax = r.Type; continue;
+                    case ScopedTypeSyntax s: syntax = s.Type; continue;
+                    case QualifiedNameSyntax q: syntax = q.Right; continue;
+                    case AliasQualifiedNameSyntax a: syntax = a.Name; continue;
+                    case GenericNameSyntax g: return k < g.TypeArgumentList.Arguments.Count ? g.TypeArgumentList.Arguments[k] : null;
+                    default: return null;
+                }
+            }
         }
 
         /// <summary>The lifetimes a method declares: <c>['a, 'b]</c> for <c>First&lt;'a, 'b&gt;</c>.</summary>
@@ -73,9 +143,26 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             var declared = Declared(type);
             if (declared.IsEmpty) return null;
             var written = syntax is null ? new List<string>() : Arguments(syntax);
+            int writtenCount = WrittenCount(type);
             var slots = new string[declared.Length];
             for (int k = 0; k < slots.Length; k++)
-                slots[k] = k < written.Count && written[k] != "'_" ? written[k] : "'#elided" + position + "." + k;
+            {
+                if (k < writtenCount)
+                {
+                    slots[k] = k < written.Count && written[k] != "'_" ? written[k] : "'#elided" + position + "." + k;
+                    continue;
+                }
+                // An implicit slot takes the lifetime of the type argument: Stack<T> gives T's, Stack<int> 'static.
+                var all = AllTypeParameters(((NamedTypeSymbol)type).OriginalDefinition);
+                var args = AllTypeArguments((NamedTypeSymbol)type);
+                // Only parametric parameters have a slot: find the argument for slot k.
+                int i = -1;
+                for (int seen = writtenCount - 1, j = 0; j < all.Count; j++)
+                    if (OwnershipFacts.IsParametric(all[j]) && ++seen == k) { i = j; break; }
+                int own = i - (all.Count - ((NamedTypeSymbol)type).Arity);
+                string name = i >= 0 && i < args.Count ? TypeArgumentLifetime(args[i], syntax is null || own < 0 ? null : TypeArgumentSyntax(syntax, own)) : null;
+                slots[k] = name ?? "'#elided" + position + "." + k;
+            }
             return slots;
         }
 
@@ -96,7 +183,18 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 if (name is null && args.Count > 0 && args.All(a => a == args[0])) name = args[0];
                 if (name is not null) return declared.IndexOf(name);
             }
+            // A field that holds one of the type's parameters (`List<T> _items`) borrows for its slot.
+            var parametric = OwnershipFacts.ParametricIn(field.OriginalDefinition.Type);
+            if (parametric.Count == 1) return declared.IndexOf(OwnershipFacts.TypeParameterLifetime(parametric[0]));
             return -1;
+        }
+
+        /// <summary>The type as a field's declaration writes it, with its lifetimes.</summary>
+        public static TypeSyntax FieldTypeSyntax(FieldSymbol field)
+        {
+            foreach (var r in field.OriginalDefinition.DeclaringSyntaxReferences)
+                if (r.GetSyntax() is VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax decl }) return decl.Type;
+            return null;
         }
 
         /// <summary>Every lifetime written anywhere in a type: <c>['a]</c> for <c>List&lt;Ref&lt;'a, int&gt;&gt;</c>.</summary>
