@@ -47,6 +47,107 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             });
         }
 
+        /// <summary>One slot of a value: its name, the declared slot it unfolds (-1 for a container's element), the type argument it lies in (-1 for a written lifetime), and its index among that argument's slots (-1 when the argument is not unfolded).</summary>
+        public readonly struct Slot
+        {
+            public readonly string Name; public readonly int DefSlot, Arg, Sub;
+            public Slot(string name, int defSlot, int arg, int sub) { Name = name; DefSlot = defSlot; Arg = arg; Sub = sub; }
+        }
+
+        private static readonly ConcurrentDictionary<TypeSymbol, ImmutableArray<Slot>> s_layout = new(Symbols.SymbolEqualityComparer.AllIgnoreOptions);
+
+        /// <summary>
+        /// The slots of a value of this type, as Rust sees its lifetimes: each lifetime position in the type
+        /// is a region of its own. A type argument with slots unfolds into them (`Stack&lt;Ref&lt;'a, int&gt;&gt;` has
+        /// 'a and Ref's T), so `Option&lt;RefMut&lt;'s, Ref&lt;'y, int&gt;&gt;&gt;` keeps 's and 'y apart; a [CarriesBorrows]
+        /// container has no slot of its own, only those of its elements. In a generic body, where the
+        /// arguments are type parameters, this is <see cref="Declared(TypeSymbol)"/>.
+        /// </summary>
+        public static ImmutableArray<Slot> Layout(TypeSymbol t)
+        {
+            if (t is not NamedTypeSymbol n) return ImmutableArray<Slot>.Empty;
+            return s_layout.GetOrAdd(n, static t =>
+            {
+                var n = (NamedTypeSymbol)t;
+                var def = n.OriginalDefinition;
+                var names = Declared(def);
+                var all = AllTypeParameters(def);
+                var args = AllTypeArguments(n);
+                var result = ImmutableArray.CreateBuilder<Slot>();
+                void Unfold(int defSlot, int j, string name)
+                {
+                    if (j >= args.Count) return;
+                    var inner = Layout(args[j]);
+                    // What holds no borrow (`int` in Ref<'a, int>) has no lifetime, as in Rust.
+                    if (inner.IsEmpty && args[j] is not TypeParameterSymbol && !OwnershipFacts.IsBorrowHolder(args[j]) && !OwnershipFacts.CarriesBorrowsOrSlots(args[j])) return;
+                    if (inner.IsEmpty) { if (defSlot >= 0) result.Add(new Slot(name, defSlot, j, -1)); }
+                    else for (int s = 0; s < inner.Length; s++) result.Add(new Slot(name + "/" + s, defSlot, j, s));
+                }
+                if (!names.IsEmpty)
+                {
+                    int written = WrittenCount(def);
+                    for (int k = 0; k < written; k++) result.Add(new Slot(names[k], k, -1, -1));
+                    for (int j = 0, k = written; j < all.Count; j++)
+                        if (OwnershipFacts.HasSlot(all[j])) { Unfold(k, j, names[k]); k++; }
+                }
+                else if (OwnershipFacts.HasAttribute(def, "CarriesBorrowsAttribute"))
+                    for (int j = 0; j < all.Count; j++) Unfold(-1, j, OwnershipFacts.TypeParameterLifetime(all[j]));
+                return result.ToImmutable();
+            });
+        }
+
+        /// <summary>
+        /// The names a signature gives a parameter or result of type <paramref name="decl"/>, for a value of the
+        /// substituted type <paramref name="actual"/>: where the declaration has a type parameter P and the
+        /// argument for it has slots, they are P's (`'#T:P/0`, …), the same in every place P appears, as Rust
+        /// substitutes T. Null when the shapes do not match.
+        /// </summary>
+        public static string[] Expand(TypeSymbol decl, TypeSymbol actual, string[] names)
+        {
+            var target = Layout(actual);
+            if (target.IsEmpty) return null;
+            var result = new List<string>();
+            int di = 0;
+            bool ok = true;
+            string Next() { if (names is null || di >= names.Length) { ok = false; return null; } return names[di++]; }
+            void Walk(TypeSymbol d, TypeSymbol a)
+            {
+                if (d is TypeParameterSymbol p)
+                {
+                    for (int s = 0; s < Layout(a).Length; s++) result.Add(OwnershipFacts.TypeParameterLifetime(p) + "/" + s);
+                    return;
+                }
+                if (d is not NamedTypeSymbol dn || a is not NamedTypeSymbol an || !ReferenceEquals(dn.OriginalDefinition, an.OriginalDefinition)) { ok = false; return; }
+                var la = Layout(an);
+                var ld = Layout(dn);
+                var dArgs = AllTypeArguments(dn);
+                var aArgs = AllTypeArguments(an);
+                foreach (var e in la) if (e.Arg < 0) result.Add(Next());
+                for (int j = 0; j < dArgs.Count && j < aArgs.Count && ok; j++)
+                {
+                    int declared = ld.Count(x => x.Arg == j), present = la.Count(x => x.Arg == j);
+                    bool unfolded = la.Any(x => x.Arg == j && x.Sub >= 0);
+                    if (dArgs[j] is TypeParameterSymbol)
+                    {
+                        // T in the declaration: the argument's own slots are T's, named after T.
+                        var mine = new List<string>();
+                        for (int x = 0; x < declared; x++) mine.Add(Next());
+                        if (unfolded) Walk(dArgs[j], aArgs[j]);
+                        else if (present == declared) result.AddRange(mine);
+                        else if (present != 0) ok = false;
+                    }
+                    else if (!Layout(dArgs[j]).IsEmpty && unfolded) Walk(dArgs[j], aArgs[j]);
+                    else
+                    {
+                        for (int x = 0; x < declared; x++) { var name = Next(); if (present == declared) result.Add(name); }
+                        if (present != declared && present != 0) ok = false;
+                    }
+                }
+            }
+            Walk(decl, actual);
+            return ok && result.Count == target.Length ? result.ToArray() : null;
+        }
+
         /// <summary>
         /// The lifetimes a type's declaration writes, read from syntax alone: what the binder checks a
         /// type's lifetime arguments against (CS9939), before any symbol is bound.
@@ -88,7 +189,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         public static string TypeArgumentLifetime(TypeSymbol argument, TypeSyntax syntax)
         {
             if (argument is TypeParameterSymbol slotted && OwnershipFacts.HasSlot(slotted)) return OwnershipFacts.TypeParameterLifetime(slotted);
-            var parametric = OwnershipFacts.ParametricIn(argument);
+            var parametric = OwnershipFacts.SlotParametersIn(argument);
             if (parametric.Count == 1) return OwnershipFacts.TypeParameterLifetime(parametric[0]);
             if (parametric.Count > 1) return null;
             if (!OwnershipFacts.IsBorrowHolder(argument) && !OwnershipFacts.CarriesBorrowsOrSlots(argument)) return "'static";
@@ -144,28 +245,33 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// </summary>
         public static string[] Slots(TypeSymbol type, TypeSyntax syntax, string position)
         {
-            var declared = Declared(type);
-            if (declared.IsEmpty) return null;
+            var layout = Layout(type);
+            if (layout.IsEmpty) return null;
+            var n = (NamedTypeSymbol)type;
             var written = syntax is null ? new List<string>() : Arguments(syntax);
-            int writtenCount = WrittenCount(type);
-            var slots = new string[declared.Length];
+            var args = AllTypeArguments(n);
+            int ownOffset = AllTypeParameters(n.OriginalDefinition).Count - n.Arity;
+            var unfolded = new Dictionary<int, string[]>();
+            var slots = new string[layout.Length];
             for (int k = 0; k < slots.Length; k++)
             {
-                if (k < writtenCount)
+                var e = layout[k];
+                if (e.Arg < 0)
                 {
-                    slots[k] = k < written.Count && written[k] != "'_" ? written[k] : "'#elided" + position + "." + k;
+                    slots[k] = e.DefSlot < written.Count && written[e.DefSlot] != "'_" ? written[e.DefSlot] : "'#elided" + position + "." + k;
                     continue;
                 }
-                // An implicit slot takes the lifetime of the type argument: Stack<T> gives T's, Stack<int> 'static.
-                var all = AllTypeParameters(((NamedTypeSymbol)type).OriginalDefinition);
-                var args = AllTypeArguments((NamedTypeSymbol)type);
-                // Only parametric parameters have a slot: find the argument for slot k.
-                int i = -1;
-                for (int seen = writtenCount - 1, j = 0; j < all.Count; j++)
-                    if (OwnershipFacts.HasSlot(all[j]) && ++seen == k) { i = j; break; }
-                int own = i - (all.Count - ((NamedTypeSymbol)type).Arity);
-                string name = i >= 0 && i < args.Count ? TypeArgumentLifetime(args[i], syntax is null || own < 0 ? null : TypeArgumentSyntax(syntax, own)) : null;
-                slots[k] = name ?? "'#elided" + position + "." + k;
+                int own = e.Arg - ownOffset;
+                var argSyntax = syntax is null || own < 0 ? null : TypeArgumentSyntax(syntax, own);
+                if (e.Sub < 0)
+                {
+                    // An implicit slot takes the lifetime of the type argument: Stack<T> gives T's, Stack<int> 'static.
+                    slots[k] = TypeArgumentLifetime(args[e.Arg], argSyntax) ?? "'#elided" + position + "." + k;
+                    continue;
+                }
+                // An argument with slots of its own unfolds into them, each named as it is written there.
+                if (!unfolded.TryGetValue(e.Arg, out var inner)) unfolded[e.Arg] = inner = Slots(args[e.Arg], argSyntax, position + "/" + e.Arg);
+                slots[k] = inner[e.Sub];
             }
             return slots;
         }
@@ -296,7 +402,22 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         public static Variance VarianceOf(TypeSymbol type, int slot)
         {
             if (type is not NamedTypeSymbol n) return Variance.Covariant;
+            var layout = Layout(n);
+            if (slot < 0 || slot >= layout.Length) return Variance.Covariant;
+            var e = layout[slot];
             var def = n.OriginalDefinition;
+            // A container's element: covariant, as Vec<T>; UnsafeCell's is invariant.
+            var outer = e.DefSlot >= 0 ? DefVariance(def, e.DefSlot) : IsUnsafeCell(def) ? Variance.Invariant : Variance.Covariant;
+            var args = AllTypeArguments(n);
+            if (e.Sub >= 0) return Compose(outer, VarianceOf(args[e.Arg], e.Sub));
+            // A slot that stands for all regions of what it holds: holding something invariant makes it invariant.
+            if (e.Arg >= 0 && OwnershipFacts.ContainsInvariance(args[e.Arg])) return Variance.Invariant;
+            return outer;
+        }
+
+        /// <summary>The variance of a type's definition in its declared slot, derived from its fields.</summary>
+        private static Variance DefVariance(NamedTypeSymbol def, int slot)
+        {
             if (OwnershipFacts.IsReference(def))
                 return def.Name == "RefMut" && slot >= WrittenCount(def) ? Variance.Invariant : Variance.Covariant;
             var names = Declared(def);
@@ -366,10 +487,14 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                         for (int k = 0; k < slots.Length; k++)
                             if (slots[k] == target) v = Join(v, VarianceOf(m, k));
                         // An argument may hold the lifetime in a way the slot names cannot say (`List<Ref<'a, int>>`).
+                        var layout = Layout(m);
                         for (int k = 0; k < args.Count; k++)
                         {
+                            int at = -1;
+                            for (int x = 0; x < layout.Length; x++) if (layout[x].Arg == k) { at = layout[x].Sub < 0 ? x : -2; break; }
+                            if (at < 0) continue;
                             var nested = VarianceIn(args[k], syntax is null ? null : TypeArgumentSyntax(syntax, k), target);
-                            if (nested != Variance.Bivariant) v = Join(v, Compose(VarianceOf(m, WrittenCount(m) + k), nested));
+                            if (nested != Variance.Bivariant) v = Join(v, Compose(VarianceOf(m, at), nested));
                         }
                         return v;
                     }

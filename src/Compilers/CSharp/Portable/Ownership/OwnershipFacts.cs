@@ -42,6 +42,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// For a reference to an older ref struct without them, the name is that struct's data instead.
         /// </summary>
         public bool[] NamesBorrow;
+        /// <summary>The lifetime of the type parameter a by-value result is (`T Unwrap()`), or null.</summary>
+        public string OutputHeld;
         /// <summary>
         /// Inputs that are `out` or `ref` parameters which the callee fills with what it holds, such as
         /// Option's <c>Deconstruct(out T value)</c> behind the pattern <c>Some(var v)</c>: what lands there may
@@ -282,6 +284,38 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         public static bool HasSlot(TypeParameterSymbol tp)
             => IsParametric(tp) || (tp.ContainingSymbol is NamedTypeSymbol owner && IsReference(owner));
 
+        /// <summary>The type parameters with a slot that a type mentions, in order: like <see cref="ParametricIn"/>, also for the core library's.</summary>
+        public static List<TypeParameterSymbol> SlotParametersIn(TypeSymbol t)
+        {
+            var found = new List<TypeParameterSymbol>();
+            void Walk(TypeSymbol x)
+            {
+                switch (x)
+                {
+                    case TypeParameterSymbol tp when HasSlot(tp): if (!found.Contains(tp)) found.Add(tp); break;
+                    case ArrayTypeSymbol a: Walk(a.ElementType); break;
+                    case NamedTypeSymbol n: foreach (var a in n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics) Walk(a.Type); break;
+                }
+            }
+            Walk(t);
+            return found;
+        }
+
+        /// <summary>
+        /// Whether a type uses some region inside it invariantly: a RefMut over something that borrows, an
+        /// UnsafeCell, delegate or interface holding borrows, or such a type anywhere among its arguments. A
+        /// slot stands for all regions of what it holds, so a slot holding such a type must be invariant.
+        /// </summary>
+        public static bool ContainsInvariance(TypeSymbol t)
+        {
+            if (t is not NamedTypeSymbol n) return false;
+            var args = n.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics;
+            bool holds(TypeSymbol a) => IsBorrowHolder(a) || CarriesBorrowsOrSlots(a);
+            if (IsReference(n) && n.Name == "RefMut" && args.Length == 1 && holds(args[0].Type)) return true;
+            if ((n.TypeKind is TypeKind.Delegate or TypeKind.Interface || n.Name == "UnsafeCell") && args.Any(a => holds(a.Type))) return true;
+            return args.Any(a => ContainsInvariance(a.Type));
+        }
+
         /// <summary>Whether a type's own lifetimes are spelled out: a type parameter with a slot, or a type with slots.</summary>
         public static bool LifetimesSpelledOut(TypeSymbol t)
             => t is TypeParameterSymbol tp ? HasSlot(tp) : !Lifetimes.Declared(t).IsEmpty;
@@ -363,7 +397,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             });
         }
 
-        public static bool IsCoroutine(MethodSymbol m) => m.IsAsync || m.IsIterator;
+        public static bool IsCoroutine(MethodSymbol m) => m.IsAsync || m.OriginalDefinition.IsIterator;
 
         /// <summary>Rust's FnOnce: such a delegate may consume its captures, and calling it consumes it.</summary>
         public static bool IsOnceDelegate(TypeSymbol t) => t.IsDelegateType() && HasAttribute(t, "OnceAttribute");
@@ -376,7 +410,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
         /// <summary>What a coroutine's `return` produces: T for Task&lt;T&gt;, nothing otherwise.</summary>
         public static TypeSymbol CoroutineResult(MethodSymbol m, CSharpCompilation compilation)
         {
-            if (m.IsAsync && !m.IsIterator && m.ReturnType is NamedTypeSymbol { Arity: 1 } task) return task.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics[0].Type;
+            if (m.IsAsync && !m.OriginalDefinition.IsIterator && m.ReturnType is NamedTypeSymbol { Arity: 1 } task) return task.TypeArgumentsWithAnnotationsNoUseSiteDiagnostics[0].Type;
             return compilation.GetSpecialType(SpecialType.System_Void);
         }
 
@@ -555,8 +589,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 var parametric = ParametricIn(p.Type);
                 if (parametric.Count > 0) borrow = true;
                 namesBorrow.Add(name is not null && p.RefKind != RefKind.None && LifetimesSpelledOut(p.Type));
-                heldLifetimes.Add(parametric.Count == 1 ? TypeParameterLifetime(parametric[0])
-                    : referenceType && p.Type is TypeParameterSymbol ownT && HasSlot(ownT) ? TypeParameterLifetime(ownT) : null);
+                var slotted = SlotParametersIn(p.Type);
+                heldLifetimes.Add(slotted.Count == 1 ? TypeParameterLifetime(slotted[0]) : null);
                 // Ref and RefMut are the references themselves: their parameters name the borrow ('a), and what
                 // T holds lives in T's slot, as in Rust's &'a T.
                 if (name is null && parametric.Count == 1 && !referenceType) name = TypeParameterLifetime(parametric[0]);
@@ -564,7 +598,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
                 scoped.Add(p.EffectiveScope != ScopedKind.None);
             }
 
-            var sig = new LifetimeSig { Inputs = inputs.ToArray(), Held = heldLifetimes.ToArray(), NamesBorrow = namesBorrow.ToArray() };
+            var sig = new LifetimeSig { Inputs = inputs.ToArray(), Held = heldLifetimes.ToArray(), NamesBorrow = namesBorrow.ToArray(),
+                OutputHeld = m.RefKind == RefKind.None && m.ReturnType is TypeParameterSymbol resultT && HasSlot(resultT) ? TypeParameterLifetime(resultT) : null };
 
             // Lifetime parameters of the inputs' and the result's types, one name per slot.
             sig.InputSlots = new string[sig.Inputs.Length][];
@@ -644,7 +679,14 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             var parametricResult = m.ReturnsVoid || m.RefKind != RefKind.None || referenceType ? new List<TypeParameterSymbol>() : ParametricIn(m.ReturnType);
             bool returnsBorrow = m.RefKind != RefKind.None || (!m.ReturnsVoid && (IsBorrowHolder(m.ReturnType) || MayCarry(m, m.ReturnType))) || genericFromRefStruct
                 || parametricResult.Count > 0;
-            if (!returnsBorrow) return sig;
+            if (!returnsBorrow)
+            {
+                // `T Clone()`, `T CloneOf<T>(in T x)` in the core library: Rust's elision gives a lifetime only to
+                // elided places in the result, and a type parameter has none. The value carries what T stands
+                // for, the data of the inputs, not their borrows: `(x.Clone(), x)` is fine.
+                if (m.RefKind == RefKind.None && m.ReturnType is TypeParameterSymbol && sig.Inputs.Any(x => x != null)) sig.Output = "'#data+";
+                return sig;
+            }
 
             // Delegates: a caller of Invoke cannot see where a lambda's result comes from, so it binds the
             // result to every input, the delegate included (for a [Mut] one, its exclusive borrow). A lambda's

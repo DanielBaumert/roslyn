@@ -1822,6 +1822,206 @@
         <target state="translated">Metoda „{0}” określa ograniczenie „struct” dla parametru typu „{1}”, lecz odpowiadający parametr typu „{2}” przesłoniętej lub jawnie zaimplementowanej metody „{3}” nie jest nienullowalnym typem wartości.</target>
         <note />
       </trans-unit>
+      <trans-unit id="ERR_OwnAssignImmutable">
+        <source>cannot assign twice to immutable variable `{0}`</source>
+        <target state="new">cannot assign twice to immutable variable `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnAssignThroughShared">
+        <source>cannot assign to `{0}`, which is behind a shared reference</source>
+        <target state="new">cannot assign to `{0}`, which is behind a shared reference</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnAssignToBorrowed">
+        <source>cannot assign to `{0}` because it is borrowed</source>
+        <target state="new">cannot assign to `{0}` because it is borrowed</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnBorrowImmutable">
+        <source>`{0}` is not declared `mut`, so it cannot change</source>
+        <target state="new">`{0}` is not declared `mut`, so it cannot change</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnBorrowOfMovedValue">
+        <source>borrow of moved value: `{0}`</source>
+        <target state="new">borrow of moved value: `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnClosureMutates">
+        <source>this lambda changes `{0}`, so its delegate type must be [Mut]</source>
+        <target state="new">this lambda changes `{0}`, so its delegate type must be [Mut]</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnClosureOutlives">
+        <source>closure may outlive the current function, but it borrows `{0}`</source>
+        <target state="new">closure may outlive the current function, but it borrows `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnDoesNotLiveLongEnough">
+        <source>`{0}` does not live long enough</source>
+        <target state="new">`{0}` does not live long enough</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnDoubleMutBorrow">
+        <source>cannot borrow `{0}` as mutable more than once at a time</source>
+        <target state="new">cannot borrow `{0}` as mutable more than once at a time</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnLifetimeArity">
+        <source>`{0}` declares {1} lifetime parameter(s), but {2} lifetime argument(s) were written</source>
+        <target state="new">`{0}` declares {1} lifetime parameter(s), but {2} lifetime argument(s) were written</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnLifetimeMismatch">
+        <source>lifetime may not live long enough: `{0}` must outlive `{1}`</source>
+        <target state="new">lifetime may not live long enough: `{0}` must outlive `{1}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMissingLifetimeSpecifier">
+        <source>missing lifetime specifier: the return value borrows from one of several inputs, name it with a lifetime or mark the others `scoped`</source>
+        <target state="new">missing lifetime specifier: the return value borrows from one of several inputs, name it with a lifetime or mark the others `scoped`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMoveOutOfBorrow">
+        <source>cannot move out of `{0}`, which is behind a {1}</source>
+        <target state="new">cannot move out of `{0}`, which is behind a {1}</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMoveOutOfDropType">
+        <source>cannot move out of `{0}`, because its type `{1}` has a destructor</source>
+        <target state="new">cannot move out of `{0}`, because its type `{1}` has a destructor</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMoveOutOfIndex">
+        <source>cannot move out of array element `{0}`</source>
+        <target state="new">cannot move out of array element `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMoveOutOfStatic">
+        <source>cannot move out of static field `{0}`</source>
+        <target state="new">cannot move out of static field `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMoveWhileBorrowed">
+        <source>cannot move out of `{0}` because it is borrowed</source>
+        <target state="new">cannot move out of `{0}` because it is borrowed</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMustNotSuspend">
+        <source>`{0}` must not be held across an `await`</source>
+        <target state="new">`{0}` must not be held across an `await`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMutBorrowThroughShared">
+        <source>cannot borrow `{0}` as mutable, because it is behind a shared reference</source>
+        <target state="new">cannot borrow `{0}` as mutable, because it is behind a shared reference</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnMutBorrowWhileShared">
+        <source>cannot borrow `{0}` as mutable because it is also borrowed as immutable</source>
+        <target state="new">cannot borrow `{0}` as mutable because it is also borrowed as immutable</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNoDynamic">
+        <source>`dynamic` does not exist: use an interface for dynamic dispatch (Rust's `dyn Trait`), or `object` with `is` to look at the type (Rust's `dyn Any`)</source>
+        <target state="new">`dynamic` does not exist: use an interface for dynamic dispatch (Rust's `dyn Trait`), or `object` with `is` to look at the type (Rust's `dyn Any`)</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNoExceptions">
+        <source>there are no exceptions: return a Result for errors, and call Panic.Raise for bugs</source>
+        <target state="new">there are no exceptions: return a Result for errors, and call Panic.Raise for bugs</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNoInheritance">
+        <source>there is no inheritance: implement an interface (a trait), or use an enum with data</source>
+        <target state="new">there is no inheritance: implement an interface (a trait), or use an enum with data</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNoNull">
+        <source>`null` does not exist: every reference has a value. A value that may be missing is an Option&lt;T&gt;: write `None` (or `Option&lt;T&gt;.None`), and `Some(value)` when there is one</source>
+        <target state="new">`null` does not exist: every reference has a value. A value that may be missing is an Option&lt;T&gt;: write `None` (or `Option&lt;T&gt;.None`), and `Some(value)` when there is one</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNoNullOperator">
+        <source>`{0}` works on null, and there is no null: {1}</source>
+        <target state="new">`{0}` works on null, and there is no null: {1}</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNoNullableContext">
+        <source>`#nullable` does not exist: references are never null, so there is nothing to switch on or off. A value that may be missing is an Option&lt;T&gt;</source>
+        <target state="new">`#nullable` does not exist: references are never null, so there is nothing to switch on or off. A value that may be missing is an Option&lt;T&gt;</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNotClone">
+        <source>`{0}` does not implement Clone</source>
+        <target state="new">`{0}` does not implement Clone</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNotSend">
+        <source>`{0}` cannot be sent between threads safely</source>
+        <target state="new">`{0}` cannot be sent between threads safely</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNotSync">
+        <source>`{0}` cannot be shared between threads safely</source>
+        <target state="new">`{0}` cannot be shared between threads safely</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnNullDefault">
+        <source>{0} would hold null, and there is no null: `{1}` has no value of its own. {2}</source>
+        <target state="new">{0} would hold null, and there is no null: `{1}` has no value of its own. {2}</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnOwnershipUnsupported">
+        <source>not supported in ownership mode: {0}</source>
+        <target state="new">not supported in ownership mode: {0}</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnPropagateOperand">
+        <source>the `?` operator can only be applied to a Result or an Option, not to `{0}`</source>
+        <target state="new">the `?` operator can only be applied to a Result or an Option, not to `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnPropagateReturn">
+        <source>the `?` operator can only be used in a method that returns {0}</source>
+        <target state="new">the `?` operator can only be used in a method that returns {0}</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnReadonlyOverrideMismatch">
+        <source>`{0}` must be `readonly` because the method it overrides or implements is</source>
+        <target state="new">`{0}` must be `readonly` because the method it overrides or implements is</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnRequiresUnsafe">
+        <source>{0} requires an `unsafe` context</source>
+        <target state="new">{0} requires an `unsafe` context</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnReturnRefToLocal">
+        <source>cannot return a reference to local `{0}`</source>
+        <target state="new">cannot return a reference to local `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnSharedBorrowWhileMut">
+        <source>cannot borrow `{0}` as immutable because it is also borrowed as mutable</source>
+        <target state="new">cannot borrow `{0}` as immutable because it is also borrowed as mutable</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnTemporaryDropped">
+        <source>temporary value dropped while borrowed</source>
+        <target state="new">temporary value dropped while borrowed</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnUseOfMovedValue">
+        <source>use of moved value: `{0}`</source>
+        <target state="new">use of moved value: `{0}`</target>
+        <note />
+      </trans-unit>
+      <trans-unit id="ERR_OwnUseWhileMutBorrowed">
+        <source>cannot use `{0}` because it is mutably borrowed</source>
+        <target state="new">cannot use `{0}` because it is mutably borrowed</target>
+        <note />
+      </trans-unit>
       <trans-unit id="ERR_PPIgnoredFollowsIf">
         <source>'#:' directives cannot be after '#if' directive</source>
         <target state="translated">Dyrektywy „#:” nie mogą występować po dyrektywie „#if”</target>

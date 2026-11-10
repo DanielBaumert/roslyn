@@ -695,8 +695,10 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             int rest = p.Projs.Length - i - 1;
             if (rest > 1 || (rest == 1 && (p.Projs[^1] is not DerefProj || f.Field.Type.TypeKind is not (TypeKind.Class or TypeKind.Interface)))) return null;
             var names = Lifetimes.Slots(f.Field.OriginalDefinition.Type, Lifetimes.FieldTypeSyntax(f.Field), "field");
+            // The field's type as this container has it: what its type parameters stand for unfolds the same way.
+            names = Lifetimes.Expand(f.Field.OriginalDefinition.Type, f.Field.Type, names);
             if (names is null) return null;
-            var containerNames = Lifetimes.Declared(_b.Locals[p.Local].Type.Type);
+            var containerNames = Lifetimes.Layout(_b.Locals[p.Local].Type.Type).Select(e => e.Name).ToList();
             var result = new int[names.Length];
             for (int k = 0; k < names.Length; k++)
             {
@@ -748,7 +750,47 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             if (i == 1 && IsRefToHandle(p.Local) && p.Projs.Length > 1 && p.Projs[1] is DerefProj) i = 2;
             if (i >= p.Projs.Length || p.Projs[i] is not FieldProj f) return -1;
             field = f.Field;
-            return Lifetimes.FieldSlot(f.Field);
+            // The declared slot, found among the value's slots; one that unfolds into several (a T that
+            // stands for a Pair<'a, 'b>) is no single region: the value's own, shorter than each, is used.
+            int declared = Lifetimes.FieldSlot(f.Field);
+            var layout = Lifetimes.Layout(_b.Locals[p.Local].Type.Type);
+            // A container's field that holds its T (a tuple's Item1): the slots T unfolds into, as Rust's `t.0`.
+            if (declared < 0)
+                return f.Field.OriginalDefinition.Type is TypeParameterSymbol && !layout.IsEmpty
+                    && OwnershipFacts.HasAttribute(f.Field.ContainingType, "CarriesBorrowsAttribute") ? -2 : -1;
+            for (int k = 0; k < layout.Length; k++)
+                if (layout[k].DefSlot == declared) return layout[k].Sub < 0 ? k : -2;
+            return -1;
+        }
+
+        private readonly Dictionary<string, int> _unfoldedRegions = new();
+
+        /// <summary>
+        /// A field whose slot unfolds (`T V` in a Box&lt;Pair&lt;'a, 'b&gt;&gt;): its value has the slots of what T
+        /// stands for, so `box.V.B` lives for 'b alone. The field as a whole lives no longer than any of them.
+        /// </summary>
+        private int UnfoldedFieldRegion(Place p)
+        {
+            int i = IsIndirect(p.Local) ? 1 : 0;
+            if (i == 1 && IsRefToHandle(p.Local) && p.Projs.Length > 1 && p.Projs[1] is DerefProj) i = 2;
+            if (i >= p.Projs.Length || p.Projs[i] is not FieldProj f) return -1;
+            var fieldPlace = new Place(p.Local, System.Collections.Immutable.ImmutableArray.CreateRange(p.Projs.Take(i + 1)));
+            if (SlotsOf(fieldPlace) is not { } slots || slots.Length == 0) return -1;
+            int next = i + 1;
+            if (next < p.Projs.Length && p.Projs[next] is DerefProj && f.Field.Type.TypeKind is TypeKind.Class) next++;
+            if (next < p.Projs.Length && p.Projs[next] is FieldProj g && Lifetimes.FieldSlot(g.Field) is int declared and >= 0)
+            {
+                var layout = Lifetimes.Layout(f.Field.Type);
+                for (int k = 0; k < layout.Length && k < slots.Length; k++)
+                    if (layout[k].DefSlot == declared && layout[k].Sub < 0) return slots[k];
+            }
+            var key = p.Local + ":" + i + ":" + f.Field.Name;
+            if (!_unfoldedRegions.TryGetValue(key, out int all))
+            {
+                _unfoldedRegions[key] = all = NewRegion();
+                foreach (var s in slots) Outlives(s, all, _b.Syntax);
+            }
+            return all;
         }
 
         private int NewRegion()
@@ -799,6 +841,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             // that slot only, also in a heap object that declares the lifetime.
             int slot = SlotField(p, out _);
             if (slot >= 0) return _localSlots[p.Local][slot];
+            if (slot == -2 && UnfoldedFieldRegion(p) is int unfolded and >= 0) return unfolded;
 
             // Nothing else in a heap object can hold a borrow: its fields live as long as the program may.
             // Tasks are the exception, because a task is a borrow holder itself.
@@ -889,7 +932,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             for (int i = 0; i < _localSlots.Length; i++)
             {
                 var type = _b.Locals[i].Type;
-                int n = Lifetimes.Declared(type.Type).Length;
+                int n = Lifetimes.Layout(type.Type).Length;
                 int whole = type.Contents ? -1 : type.IsRef ? _localInner[i] : _localRegion[i];
                 // A reference into a heap object (`&contents Index`) has no region for the object as a whole,
                 // only its slots; the object's owner keeps them alive.
@@ -1117,6 +1160,15 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             return t.IsRef || !OwnershipFacts.CarriesBorrows(t.Type) ? -1 : _localRegion[local];
         }
 
+        /// <summary>The type a method declares for its argument <paramref name="i"/> (the receiver first), with its own type parameters.</summary>
+        private static TypeSymbol DeclaredType(MethodSymbol m, int i)
+        {
+            var def = m.OriginalDefinition;
+            if (!def.IsStatic && i == 0) return def.ContainingType;
+            int p = i - (def.IsStatic ? 0 : 1);
+            return p >= 0 && p < def.Parameters.Length ? def.Parameters[p].Type : null;
+        }
+
         private void CallConstraints(CallTerm c, MethodSymbol m)
         {
             // `unsafe` escape hatch: the result of a transmute has no relation to its input.
@@ -1127,7 +1179,13 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             int Fresh(string name)
             {
                 if (name == "'static") return Universal(name);
-                if (!fresh.TryGetValue(name, out int r)) fresh[name] = r = NewRegion();
+                if (!fresh.TryGetValue(name, out int r))
+                {
+                    fresh[name] = r = NewRegion();
+                    // A region inside what T stands for outlives T's lifetime, Rust's `T: 'x` for every region in T.
+                    int part = name.LastIndexOf('/');
+                    if (part > 0 && name.StartsWith("'#T:", StringComparison.Ordinal)) Outlives(r, Fresh(name.Substring(0, part)), c.Syntax);
+                }
                 return r;
             }
 
@@ -1186,7 +1244,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             {
                 if (sig.Held?[i] is not { } tname || SlotsOf(c.Args[i]) is not { } held) continue;
                 var heldPlace = c.Args[i] is CopyOp hc ? hc.Place : ((MoveOp)c.Args[i]).Place;
-                bool storesInto = _b.TypeOf(heldPlace).Ref == RefMode.Mut;
+                bool storesInto = _b.TypeOf(heldPlace).Ref == RefMode.Mut || OwnershipFacts.ContainsInvariance(_b.TypeOf(heldPlace).Type);
                 foreach (var slot in held)
                 {
                     Outlives(slot, Fresh(tname), c.Syntax);
@@ -1217,10 +1275,13 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
 
             // Lifetime parameters: each slot of an argument outlives the lifetime its parameter names;
             // through `ref` (or a constructor's `this`) the callee may store into it, so the slot is invariant.
-            for (int i = 0; sig.InputSlots != null && i < c.Args.Count && i < sig.InputSlots.Length; i++)
+            for (int i = 0; i < c.Args.Count && i < sig.Inputs.Length; i++)
             {
-                if (sig.InputSlots[i] is not { } names || SlotsOf(c.Args[i]) is not { } slots || slots.Length != names.Length) continue;
+                if (SlotsOf(c.Args[i]) is not { } slots) continue;
                 var argPlace = c.Args[i] is CopyOp cp ? cp.Place : ((MoveOp)c.Args[i]).Place;
+                // As Rust substitutes T: each place T appears in the signature names the same slots of the argument.
+                var names = DeclaredType(m, i) is { } declared ? Lifetimes.Expand(declared, _b.TypeOf(argPlace).Type, sig.InputSlots?[i]) : sig.InputSlots?[i];
+                if (names is null || slots.Length != names.Length) continue;
                 bool invariant = _b.TypeOf(argPlace).Ref == RefMode.Mut;
                 for (int k = 0; k < slots.Length; k++)
                 {
@@ -1247,14 +1308,26 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             int dest = RegionOf(c.Dest);
             int destInner = c.Dest.IsLocal ? _localInner[c.Dest.Local] : -1;
 
-            if (sig.OutputSlots is { } outNames && SlotsOf(c.Dest) is { } outSlots && outSlots.Length == outNames.Length)
+            var resultNames = SlotsOf(c.Dest) is null ? null
+                : m.OriginalDefinition.ReturnType is { } declaredResult ? Lifetimes.Expand(declaredResult, _b.TypeOf(c.Dest).Type, sig.OutputSlots) : sig.OutputSlots;
+            if (resultNames is { } outNames && SlotsOf(c.Dest) is { } outSlots && outSlots.Length == outNames.Length)
                 for (int k = 0; k < outSlots.Length; k++)
+                    // Through a `ref` result the caller may store: invariant, as `&mut T`.
                     Relate(outNames[k] == OwnershipFacts.WholeResult ? (c.Dest.IsLocal && _b.Locals[c.Dest.Local].Type.IsRef ? destInner : dest) : Fresh(outNames[k]),
-                        outSlots[k], Lifetimes.VarianceOf(_b.TypeOf(c.Dest).Type, k), c.Syntax);
+                        outSlots[k], m.RefKind == RefKind.Ref ? Variance.Invariant : Lifetimes.VarianceOf(_b.TypeOf(c.Dest).Type, k), c.Syntax);
 
             // A result the callee sees as a type parameter brings no region of its own beyond 'T.
-            if (sig.Output is { } outT && outT.StartsWith("'#T:", StringComparison.Ordinal) && SlotsOf(c.Dest) is { } resultSlots)
-                foreach (var slot in resultSlots) Outlives(Fresh(outT), slot, c.Syntax);
+            // Bound slot by slot above, through what T stands for: as Rust, the result has exactly those lifetimes.
+            bool pointwise = resultNames is { } rn && rn.Length > 0 && rn.All(x => x.StartsWith("'#T:", StringComparison.Ordinal) && x.Contains('/'));
+            if (!pointwise && (sig.OutputHeld ?? sig.Output) is { } outT && outT.StartsWith("'#T:", StringComparison.Ordinal) && SlotsOf(c.Dest) is { } resultSlots)
+            {
+                bool exact = OwnershipFacts.ContainsInvariance(_b.TypeOf(c.Dest).Type);
+                foreach (var slot in resultSlots)
+                {
+                    Outlives(Fresh(outT), slot, c.Syntax);
+                    if (exact) Outlives(slot, Fresh(outT), c.Syntax);
+                }
+            }
 
             // A result named after an input's slot (`ref readonly 'a int First(in Pair<'a, 'b> p)`) lives for that slot.
             if (sig.IsSlotName(sig.Output))

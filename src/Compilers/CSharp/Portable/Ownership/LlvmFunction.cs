@@ -186,7 +186,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Ownership
             private MethodSymbol CoroutineFactory()
             {
                 NamedTypeSymbol owner;
-                if (_m.IsIterator)
+                // IsIterator lives on the definition: an instantiated generic method reports false.
+                if (_m.OriginalDefinition.IsIterator)
                 {
                     var generator = _g._compilation.GetTypeByMetadataName(_m.IsAsync ? "System.Threading.Tasks.AsyncGenerator`1" : "System.Collections.Generic.Generator`1");
                     owner = generator.Construct(Closed(_b.Locals[_b.YieldSlot].Type.Type));
